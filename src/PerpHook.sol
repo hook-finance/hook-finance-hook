@@ -219,6 +219,63 @@ contract PerpHook is BaseHook {
         // console2.log(delta.amount1());
     }
 
+    /// @dev Allow a user (who has already deposited collateral) to execute a leveraged trade
+    function marginTrade(
+        PoolKey memory key,
+        int128 tradeAmount
+    ) external payable {
+        // TODO - make sure collateral sufficient
+
+        // TODO - improve remove/restake logic - need to remove just enough to swap 'tradeAmount'
+
+        // Pull liquidity
+        // Restake liquidity (leaving some funds)
+        // Execute swawp
+
+        int24 tickLower = TickMath.minUsableTick(60);
+        int24 tickUpper = TickMath.maxUsableTick(60);
+        bytes memory ZERO_BYTES = new bytes(0);
+        modifyPosition(
+            key,
+            IPoolManager.ModifyPositionParams(tickLower, tickUpper, -3 ether),
+            ZERO_BYTES
+        );
+
+        // And now restake...
+        modifyPosition(
+            key,
+            IPoolManager.ModifyPositionParams(tickLower, tickUpper, 2 ether),
+            ZERO_BYTES
+        );
+
+        // And now execute swap...
+
+        // Copied from HookTest.sol
+        // uint160 MIN_PRICE_LIMIT = TickMath.MIN_SQRT_RATIO + 1;
+        // uint160 MAX_PRICE_LIMIT = TickMath.MAX_SQRT_RATIO - 1;
+        // int256 amountSpecified =
+        // bool zeroForOne = true;
+        IPoolManager.SwapParams memory params = IPoolManager.SwapParams({
+            zeroForOne: true,
+            amountSpecified: 1 ether,
+            // sqrtPriceLimitX96: zeroForOne ? MIN_PRICE_LIMIT : MAX_PRICE_LIMIT // unlimited impact
+            sqrtPriceLimitX96: TickMath.MIN_SQRT_RATIO + 1
+        });
+
+        PoolSwapTest.TestSettings memory testSettings = PoolSwapTest
+            .TestSettings({withdrawTokens: true, settleUsingTransfer: true});
+
+        TestERC20 token0 = TestERC20(Currency.unwrap(key.currency0));
+        TestERC20 token1 = TestERC20(Currency.unwrap(key.currency1));
+        token0.approve(address(swapRouter), 100 ether);
+        token1.approve(address(swapRouter), 100 ether);
+        bytes memory hookData = new bytes(0);
+        swapRouter.swap(key, params, testSettings, hookData);
+
+        // TODO - how do we track positions?
+        //positions[id][msg.sender] += tradeAmount
+    }
+
     // -----------------------------------------------
     // NOTE: see IHooks.sol for function documentation
     // -----------------------------------------------

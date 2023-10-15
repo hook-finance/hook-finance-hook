@@ -179,4 +179,28 @@ contract PerpHookTest is HookTest, Deployers, GasSnapshot {
         assertEq(position1.liquidity, 3 ether);
         // console2.log("OUR LIQ 1", position.liquidity);
     }
+
+    function test_marginTrade() public {
+        TestERC20 token0 = TestERC20(Currency.unwrap(poolKey.currency0));
+        TestERC20 token1 = TestERC20(Currency.unwrap(poolKey.currency1));
+
+        token0.approve(address(perpHook), 100 ether);
+        token1.approve(address(perpHook), 100 ether);
+
+        // Need to mint so we have funds to pull
+        // Should add a test to make sure fails gracefully if no free liquidity?
+        perpHook.lpMint(poolKey, 3 ether);
+
+        int128 tradeAmount = 1 ether;
+
+        PoolId id = poolKey.toId();
+        (uint160 sqrtPriceX96_before, , , ) = manager.getSlot0(id);
+        // console2.log("PRICE BEFORE", sqrtPriceX96);
+
+        perpHook.marginTrade(poolKey, tradeAmount);
+
+        (uint160 sqrtPriceX96_after, , , ) = manager.getSlot0(id);
+        // console2.log("PRICE AFTER", sqrtPriceX962);
+        assertGe(sqrtPriceX96_before, sqrtPriceX96_after);
+    }
 }

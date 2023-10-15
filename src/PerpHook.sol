@@ -7,17 +7,22 @@ import {Hooks} from "@uniswap/v4-core/contracts/libraries/Hooks.sol";
 import {IPoolManager} from "@uniswap/v4-core/contracts/interfaces/IPoolManager.sol";
 import {PoolKey} from "@uniswap/v4-core/contracts/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/contracts/types/PoolId.sol";
-import {BalanceDelta} from "@uniswap/v4-core/contracts/types/BalanceDelta.sol";
+import {BalanceDelta, toBalanceDelta} from "@uniswap/v4-core/contracts/types/BalanceDelta.sol";
 import {PoolModifyPositionTest} from "@uniswap/v4-core/contracts/test/PoolModifyPositionTest.sol";
 import {TickMath} from "@uniswap/v4-core/contracts/libraries/TickMath.sol";
 import {TestERC20} from "@uniswap/v4-core/contracts/test/TestERC20.sol";
 import {CurrencyLibrary, Currency} from "@uniswap/v4-core/contracts/types/Currency.sol";
-import {Position} from "@uniswap/v4-core/contracts/libraries/Position.sol";
+// import {Position} from "@uniswap/v4-core/contracts/libraries/Position.sol";
 import {PoolSwapTest} from "@uniswap/v4-core/contracts/test/PoolSwapTest.sol";
+import {SqrtPriceMath} from "@uniswap/v4-core/contracts/libraries/SqrtPriceMath.sol";
+import {SafeCast} from "@uniswap/v4-core/contracts/libraries/SafeCast.sol";
+
 import "forge-std/console2.sol";
 
 contract PerpHook is BaseHook {
+    using SafeCast for *;
     using PoolIdLibrary for PoolKey;
+    using CurrencyLibrary for Currency;
 
     // NOTE: ---------------------------------------------------------
     // state variables should typically be unique to a pool
@@ -38,16 +43,20 @@ contract PerpHook is BaseHook {
     // Only accepting one token as collateral for now, set to USDC by default
     address colTokenAddr;
 
-    PoolModifyPositionTest modifyPositionRouter;
     PoolSwapTest swapRouter;
+
+    struct CallbackData {
+        address sender;
+        PoolKey key;
+        IPoolManager.ModifyPositionParams params;
+        bytes hookData;
+    }
 
     constructor(
         IPoolManager _poolManager,
         address _colTokenAddr
     ) BaseHook(_poolManager) {
-        modifyPositionRouter = new PoolModifyPositionTest(_poolManager);
         swapRouter = new PoolSwapTest(_poolManager);
-        console2.log("MPR ADDRESS", address(modifyPositionRouter));
         colTokenAddr = _colTokenAddr;
     }
 
@@ -88,6 +97,126 @@ contract PerpHook is BaseHook {
         collateral[id][msg.sender] -= withdrawAmount;
         TestERC20(colTokenAddr).transfer(msg.sender, withdrawAmount);
         // TODO - emit some event
+    }
+
+    /// @dev Copy/paste from 'modifyPosition' function in Pool.sol, needed so we can transfer funds from LP to stake ourselves
+    function getMintBalanceDelta(
+        int24 tickLower,
+        int24 tickUpper,
+        //int256 liquidityDelta,
+        int128 liquidityDelta,
+        int24 slot0_tick,
+        uint160 slot0_sqrtPriceX96
+    ) internal returns (BalanceDelta result) {
+        // NOTE - function assumes hookFees are 0,
+        // if that changes need to add extra logic from Pool.sol function
+        if (liquidityDelta != 0) {
+            if (slot0_tick < tickLower) {
+                // current tick is below the passed range; liquidity can only become in range by crossing from left to
+                // right, when we'll need _more_ currency0 (it's becoming more valuable) so user must provide it
+                result =
+                    result +
+                    toBalanceDelta(
+                        SqrtPriceMath
+                            .getAmount0Delta(
+                                TickMath.getSqrtRatioAtTick(tickLower),
+                                TickMath.getSqrtRatioAtTick(tickUpper),
+                                liquidityDelta
+                            )
+                            .toInt128(),
+                        0
+                    );
+            } else if (slot0_tick < tickUpper) {
+                result =
+                    result +
+                    toBalanceDelta(
+                        SqrtPriceMath
+                            .getAmount0Delta(
+                                slot0_sqrtPriceX96,
+                                TickMath.getSqrtRatioAtTick(tickUpper),
+                                liquidityDelta
+                            )
+                            .toInt128(),
+                        SqrtPriceMath
+                            .getAmount1Delta(
+                                TickMath.getSqrtRatioAtTick(tickLower),
+                                slot0_sqrtPriceX96,
+                                liquidityDelta
+                            )
+                            .toInt128()
+                    );
+            } else {
+                // current tick is above the passed range; liquidity can only become in range by crossing from right to
+                // left, when we'll need _more_ currency1 (it's becoming more valuable) so user must provide it
+                result =
+                    result +
+                    toBalanceDelta(
+                        0,
+                        SqrtPriceMath
+                            .getAmount1Delta(
+                                TickMath.getSqrtRatioAtTick(tickLower),
+                                TickMath.getSqrtRatioAtTick(tickUpper),
+                                liquidityDelta
+                            )
+                            .toInt128()
+                    );
+            }
+        }
+    }
+
+    /// @dev Deposits funds to be used as both pool liquidity and funds to execute swaps
+    function lpMint(
+        PoolKey memory key,
+        int128 liquidityDelta
+    ) external payable {
+        bytes memory ZERO_BYTES = new bytes(0);
+        // mint across entire range?
+        int24 tickLower = TickMath.minUsableTick(60);
+        int24 tickUpper = TickMath.maxUsableTick(60);
+
+        PoolId id = key.toId();
+        (uint160 slot0_sqrtPriceX96, int24 slot0_tick, , ) = poolManager
+            .getSlot0(id);
+
+        // Need to precompute balance deltas so we can take funds from LP to stake ourselves
+        BalanceDelta deltaPred = getMintBalanceDelta(
+            tickLower,
+            tickUpper,
+            liquidityDelta,
+            slot0_tick,
+            slot0_sqrtPriceX96
+        );
+
+        // console2.log("BAL PRED");
+        // console2.log(deltaPred.amount0());
+        // console2.log(deltaPred.amount1());
+
+        TestERC20 token0 = TestERC20(Currency.unwrap(key.currency0));
+        TestERC20 token1 = TestERC20(Currency.unwrap(key.currency1));
+
+        // Because we're minting these values will always be positive, so uint128 cast is safe
+        // TODO - better understand what is going on here - if we comment out the token1 transfer it still works!?
+        token0.transferFrom(
+            msg.sender,
+            address(this),
+            uint128(deltaPred.amount0())
+        );
+        token1.transferFrom(
+            msg.sender,
+            address(this),
+            uint128(deltaPred.amount1())
+        );
+
+        BalanceDelta delta = modifyPosition(
+            key,
+            IPoolManager.ModifyPositionParams(tickLower, tickUpper, 3 ether),
+            ZERO_BYTES
+        );
+
+        // Should match exactly with precomputed values
+        // console2.log("BAL DELTA");
+        // console2.log(delta.amount0());
+        // console2.log(delta.amount1());
     }
 
     // -----------------------------------------------
@@ -134,5 +263,85 @@ contract PerpHook is BaseHook {
     ) external override returns (bytes4) {
         afterModifyPositionCount[key.toId()]++;
         return BaseHook.afterModifyPosition.selector;
+    }
+
+    /// @notice Copy/paste from PoolModifyPositionTest - we need it here because we want msg.sender to be our hook when we mint
+    function modifyPosition(
+        PoolKey memory key,
+        IPoolManager.ModifyPositionParams memory params,
+        bytes memory hookData
+    ) internal returns (BalanceDelta delta) {
+        delta = abi.decode(
+            poolManager.lock(
+                abi.encode(CallbackData(msg.sender, key, params, hookData))
+            ),
+            (BalanceDelta)
+        );
+
+        uint256 ethBalance = address(this).balance;
+        if (ethBalance > 0) {
+            CurrencyLibrary.NATIVE.transfer(msg.sender, ethBalance);
+        }
+    }
+
+    /// @notice Copy/paste from PoolModifyPositionTest
+    function lockAcquired(
+        bytes calldata rawData
+    ) external override returns (bytes memory) {
+        require(msg.sender == address(poolManager));
+
+        CallbackData memory data = abi.decode(rawData, (CallbackData));
+
+        BalanceDelta delta = poolManager.modifyPosition(
+            data.key,
+            data.params,
+            data.hookData
+        );
+
+        if (delta.amount0() > 0) {
+            if (data.key.currency0.isNative()) {
+                poolManager.settle{value: uint128(delta.amount0())}(
+                    data.key.currency0
+                );
+            } else {
+                TestERC20(Currency.unwrap(data.key.currency0)).transferFrom(
+                    data.sender,
+                    address(poolManager),
+                    uint128(delta.amount0())
+                );
+                poolManager.settle(data.key.currency0);
+            }
+        }
+        if (delta.amount1() > 0) {
+            if (data.key.currency1.isNative()) {
+                poolManager.settle{value: uint128(delta.amount1())}(
+                    data.key.currency1
+                );
+            } else {
+                TestERC20(Currency.unwrap(data.key.currency1)).transferFrom(
+                    data.sender,
+                    address(poolManager),
+                    uint128(delta.amount1())
+                );
+                poolManager.settle(data.key.currency1);
+            }
+        }
+
+        if (delta.amount0() < 0) {
+            poolManager.take(
+                data.key.currency0,
+                data.sender,
+                uint128(-delta.amount0())
+            );
+        }
+        if (delta.amount1() < 0) {
+            poolManager.take(
+                data.key.currency1,
+                data.sender,
+                uint128(-delta.amount1())
+            );
+        }
+
+        return abi.encode(delta);
     }
 }

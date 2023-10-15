@@ -15,6 +15,7 @@ import {HookTest} from "./utils/HookTest.sol";
 import {PerpHook} from "../src/PerpHook.sol";
 import {HookMiner} from "./utils/HookMiner.sol";
 import {TestERC20} from "@uniswap/v4-core/contracts/test/TestERC20.sol";
+import {Position} from "@uniswap/v4-core/contracts/libraries/Position.sol";
 
 contract PerpHookTest is HookTest, Deployers, GasSnapshot {
     using PoolIdLibrary for PoolKey;
@@ -125,5 +126,57 @@ contract PerpHookTest is HookTest, Deployers, GasSnapshot {
         perpHook.withdrawCollateral(poolKey, depositAmount + 1 ether);
         // But withdrawing normal amount should work
         perpHook.withdrawCollateral(poolKey, depositAmount);
+    }
+
+    function test_lpMint() public {
+        TestERC20 token0 = TestERC20(Currency.unwrap(poolKey.currency0));
+        TestERC20 token1 = TestERC20(Currency.unwrap(poolKey.currency1));
+
+        token0.approve(address(perpHook), 100 ether);
+        token1.approve(address(perpHook), 100 ether);
+
+        //console.log("PERPHOOK", address(perpHook));
+        //console.log("TEEST SCIRPT", address(this));
+
+        // Don't need to transfer now since we transfer in the hook
+        //token0.transfer(address(perpHook), 11 ether);
+        //token1.transfer(address(perpHook), 11 ether);
+
+        // perpHook.mint{value: 10 ether}(poolKey);
+        // These are hardcoded in function, need to change if func changes
+        int24 tickLower = TickMath.minUsableTick(60);
+        int24 tickUpper = TickMath.maxUsableTick(60);
+
+        PoolId id = poolKey.toId();
+        //address owner = address(this);
+        address owner = address(perpHook);
+        Position.Info memory position0 = manager.getPosition(
+            id,
+            owner,
+            tickLower,
+            tickUpper
+        );
+        // Should start with 0...
+        assertEq(position0.liquidity, 0);
+        // console2.log("OUR LIQ 0", position0.liquidity);
+
+        perpHook.lpMint(poolKey, 3 ether);
+
+        //uint128 liquidity = manager.getLiquidity(
+        //    id,
+        //    owner,
+        //    tickLower,
+        //    tickUpper
+        //);
+
+        Position.Info memory position1 = manager.getPosition(
+            id,
+            owner,
+            tickLower,
+            tickUpper
+        );
+        // We minted 3*10^18 liquidity...
+        assertEq(position1.liquidity, 3 ether);
+        // console2.log("OUR LIQ 1", position.liquidity);
     }
 }

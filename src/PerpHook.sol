@@ -8,6 +8,13 @@ import {IPoolManager} from "@uniswap/v4-core/contracts/interfaces/IPoolManager.s
 import {PoolKey} from "@uniswap/v4-core/contracts/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/contracts/types/PoolId.sol";
 import {BalanceDelta} from "@uniswap/v4-core/contracts/types/BalanceDelta.sol";
+import {PoolModifyPositionTest} from "@uniswap/v4-core/contracts/test/PoolModifyPositionTest.sol";
+import {TickMath} from "@uniswap/v4-core/contracts/libraries/TickMath.sol";
+import {TestERC20} from "@uniswap/v4-core/contracts/test/TestERC20.sol";
+import {CurrencyLibrary, Currency} from "@uniswap/v4-core/contracts/types/Currency.sol";
+import {Position} from "@uniswap/v4-core/contracts/libraries/Position.sol";
+import {PoolSwapTest} from "@uniswap/v4-core/contracts/test/PoolSwapTest.sol";
+import "forge-std/console2.sol";
 
 contract PerpHook is BaseHook {
     using PoolIdLibrary for PoolKey;
@@ -23,7 +30,26 @@ contract PerpHook is BaseHook {
     mapping(PoolId => uint256 count) public beforeModifyPositionCount;
     mapping(PoolId => uint256 count) public afterModifyPositionCount;
 
-    constructor(IPoolManager _poolManager) BaseHook(_poolManager) {}
+    // Track collateral amounts of users
+    // Collateral is at pool level...
+    // mapping(address => uint256 colAmount) public collateral;
+    mapping(PoolId => mapping(address => uint256 colAmount)) public collateral;
+
+    // Only accepting one token as collateral for now, set to USDC by default
+    address colTokenAddr;
+
+    PoolModifyPositionTest modifyPositionRouter;
+    PoolSwapTest swapRouter;
+
+    constructor(
+        IPoolManager _poolManager,
+        address _colTokenAddr
+    ) BaseHook(_poolManager) {
+        modifyPositionRouter = new PoolModifyPositionTest(_poolManager);
+        swapRouter = new PoolSwapTest(_poolManager);
+        console2.log("MPR ADDRESS", address(modifyPositionRouter));
+        colTokenAddr = _colTokenAddr;
+    }
 
     function getHooksCalls() public pure override returns (Hooks.Calls memory) {
         return
@@ -37,6 +63,31 @@ contract PerpHook is BaseHook {
                 beforeDonate: false,
                 afterDonate: false
             });
+    }
+
+    function depositCollateral(
+        PoolKey memory key,
+        uint256 depositAmount
+    ) external payable {
+        TestERC20(colTokenAddr).transferFrom(
+            msg.sender,
+            address(this),
+            depositAmount
+        );
+        PoolId id = key.toId();
+        collateral[id][msg.sender] += depositAmount;
+        // TODO - emit some event
+    }
+
+    function withdrawCollateral(
+        PoolKey memory key,
+        uint256 withdrawAmount
+    ) external {
+        PoolId id = key.toId();
+        require(collateral[id][msg.sender] >= withdrawAmount);
+        collateral[id][msg.sender] -= withdrawAmount;
+        TestERC20(colTokenAddr).transfer(msg.sender, withdrawAmount);
+        // TODO - emit some event
     }
 
     // -----------------------------------------------

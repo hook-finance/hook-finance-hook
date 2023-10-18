@@ -191,16 +191,34 @@ contract PerpHookTest is HookTest, Deployers, GasSnapshot {
         // Should add a test to make sure fails gracefully if no free liquidity?
         perpHook.lpMint(poolKey, 3 ether);
 
+        // int24 tickLower = TickMath.minUsableTick(60);
+        // int24 tickUpper = TickMath.maxUsableTick(60);
+        // PoolId id = poolKey.toId();
+        // address owner = address(perpHook);
+        // uint128 liquidity = manager.getLiquidity(
+        //     id,
+        //     owner,
+        //     tickLower,
+        //     tickUpper
+        // );
+        // console.log("MINTED LIQUIDITY", liquidity);
+
         int128 tradeAmount = 1 ether;
 
         PoolId id = poolKey.toId();
         (uint160 sqrtPriceX96_before, , , ) = manager.getSlot0(id);
         // console2.log("PRICE BEFORE", sqrtPriceX96);
 
+        // With no collateral should fail!
+        vm.expectRevert();
+        perpHook.marginTrade(poolKey, tradeAmount);
+
+        uint depositAmount = 5 ether;
+        perpHook.depositCollateral(poolKey, depositAmount);
         perpHook.marginTrade(poolKey, tradeAmount);
 
         (uint160 sqrtPriceX96_after, , , ) = manager.getSlot0(id);
         // console2.log("PRICE AFTER", sqrtPriceX962);
-        assertGe(sqrtPriceX96_before, sqrtPriceX96_after);
+        assertGt(sqrtPriceX96_after, sqrtPriceX96_before);
     }
 }

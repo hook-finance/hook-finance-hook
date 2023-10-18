@@ -16,6 +16,8 @@ import {CurrencyLibrary, Currency} from "@uniswap/v4-core/contracts/types/Curren
 import {PoolSwapTest} from "@uniswap/v4-core/contracts/test/PoolSwapTest.sol";
 import {SqrtPriceMath} from "@uniswap/v4-core/contracts/libraries/SqrtPriceMath.sol";
 import {SafeCast} from "@uniswap/v4-core/contracts/libraries/SafeCast.sol";
+// import {LiquidityAmounts} from "@uniswap/v4-periphery/contracts/libraries/LiquidityAmounts.sol";
+import {LiquidityAmounts} from "lib/v4-periphery/contracts/libraries/LiquidityAmounts.sol";
 
 import "forge-std/console2.sol";
 
@@ -23,6 +25,18 @@ contract PerpHook is BaseHook {
     using SafeCast for *;
     using PoolIdLibrary for PoolKey;
     using CurrencyLibrary for Currency;
+
+    struct LeveragedPosition {
+        int128 position;
+        int256 positionNet;
+    }
+
+    struct CallbackData {
+        address sender;
+        PoolKey key;
+        IPoolManager.ModifyPositionParams params;
+        bytes hookData;
+    }
 
     // NOTE: ---------------------------------------------------------
     // state variables should typically be unique to a pool
@@ -39,18 +53,13 @@ contract PerpHook is BaseHook {
     // Collateral is at pool level...
     // mapping(address => uint256 colAmount) public collateral;
     mapping(PoolId => mapping(address => uint256 colAmount)) public collateral;
+    mapping(PoolId => mapping(address => LeveragedPosition))
+        public levPositions;
 
     // Only accepting one token as collateral for now, set to USDC by default
     address colTokenAddr;
 
     PoolSwapTest swapRouter;
-
-    struct CallbackData {
-        address sender;
-        PoolKey key;
-        IPoolManager.ModifyPositionParams params;
-        bytes hookData;
-    }
 
     constructor(
         IPoolManager _poolManager,
@@ -99,7 +108,7 @@ contract PerpHook is BaseHook {
         // TODO - emit some event
     }
 
-    /// @dev Copy/paste from 'modifyPosition' function in Pool.sol, needed so we can transfer funds from LP to stake ourselves
+    /// @notice Copy/paste from 'modifyPosition' function in Pool.sol, needed so we can transfer funds from LP to stake ourselves
     function getMintBalanceDelta(
         int24 tickLower,
         int24 tickUpper,
@@ -164,11 +173,12 @@ contract PerpHook is BaseHook {
         }
     }
 
-    /// @dev Deposits funds to be used as both pool liquidity and funds to execute swaps
+    /// @notice Deposits funds to be used as both pool liquidity and funds to execute swaps
     function lpMint(
         PoolKey memory key,
         int128 liquidityDelta
     ) external payable {
+        require(liquidityDelta > 0, "Negative stakes not allowed!");
         bytes memory ZERO_BYTES = new bytes(0);
         // mint across entire range?
         int24 tickLower = TickMath.minUsableTick(60);
@@ -187,10 +197,6 @@ contract PerpHook is BaseHook {
             slot0_sqrtPriceX96
         );
 
-        // console2.log("BAL PRED");
-        // console2.log(deltaPred.amount0());
-        // console2.log(deltaPred.amount1());
-
         TestERC20 token0 = TestERC20(Currency.unwrap(key.currency0));
         TestERC20 token1 = TestERC20(Currency.unwrap(key.currency1));
 
@@ -207,73 +213,219 @@ contract PerpHook is BaseHook {
             uint128(deltaPred.amount1())
         );
 
-        BalanceDelta delta = modifyPosition(
+        // BalanceDelta delta
+        modifyPosition(
             key,
             IPoolManager.ModifyPositionParams(tickLower, tickUpper, 3 ether),
             ZERO_BYTES
         );
-
-        // Should match exactly with precomputed values
-        // console2.log("BAL DELTA");
-        // console2.log(delta.amount0());
-        // console2.log(delta.amount1());
     }
 
-    /// @dev Allow a user (who has already deposited collateral) to execute a leveraged trade
+    /// @notice Copied from uni-v3 LiquidityManagement.sol 'addLiquidity' function
+    function getLiquidityFromAmounts(
+        uint160 sqrtPriceX96,
+        int24 tickLower,
+        int24 tickUpper,
+        uint256 amount0Desired,
+        uint256 amount1Desired
+    ) internal returns (uint128) {
+        // compute liquidity amount given some amount0 and amount1
+        //(uint160 sqrtPriceX96, , , , , , ) = pool.slot0();
+
+        uint160 sqrtRatioAX96 = TickMath.getSqrtRatioAtTick(tickLower);
+        uint160 sqrtRatioBX96 = TickMath.getSqrtRatioAtTick(tickUpper);
+
+        uint128 liquidity = LiquidityAmounts.getLiquidityForAmounts(
+            sqrtPriceX96,
+            sqrtRatioAX96,
+            sqrtRatioBX96,
+            amount0Desired,
+            amount1Desired
+        );
+        return liquidity;
+    }
+
+    function removeLiquidity(PoolKey memory key, int128 tradeAmount) internal {
+        // Hardcoding full tick range for now
+        int24 tickLower = TickMath.minUsableTick(60);
+        int24 tickUpper = TickMath.maxUsableTick(60);
+
+        PoolId id = key.toId();
+        (uint160 slot0_sqrtPriceX96, int24 slot0_tick, , ) = poolManager
+            .getSlot0(id);
+
+        uint256 amount0Desired;
+        uint256 amount1Desired;
+        if (tradeAmount > 0) {
+            amount0Desired = uint128(tradeAmount);
+            // Note - can't set to 2**256-1 or it causes some kind of overflow
+            amount1Desired = 2 ** 64;
+        } else {
+            amount0Desired = 2 ** 64;
+            amount1Desired = uint128(-tradeAmount);
+        }
+
+        // FIgure out how much we have to remove to do the swap...
+        uint256 liquidity = getLiquidityFromAmounts(
+            slot0_sqrtPriceX96,
+            tickLower,
+            tickUpper,
+            amount0Desired,
+            amount1Desired
+        );
+
+        bytes memory ZERO_BYTES = new bytes(0);
+
+        modifyPosition(
+            key,
+            IPoolManager.ModifyPositionParams(
+                tickLower,
+                tickUpper,
+                -int256(liquidity)
+            ),
+            ZERO_BYTES
+        );
+    }
+
+    /// @notice from https://ethereum.stackexchange.com/questions/2910/can-i-square-root-in-solidity
+    /// @notice Calculates the square root of x, rounding down.
+    /// @dev Uses the Babylonian method https://en.wikipedia.org/wiki/Methods_of_computing_square_roots#Babylonian_method.
+    /// @param x The uint256 number for which to calculate the square root.
+    /// @return result The result as an uint256.
+    function sqrt(uint256 x) internal pure returns (uint256 result) {
+        if (x == 0) {
+            return 0;
+        }
+
+        // Calculate the square root of the perfect square of a power of two that is the closest to x.
+        uint256 xAux = uint256(x);
+        result = 1;
+        if (xAux >= 0x100000000000000000000000000000000) {
+            xAux >>= 128;
+            result <<= 64;
+        }
+        if (xAux >= 0x10000000000000000) {
+            xAux >>= 64;
+            result <<= 32;
+        }
+        if (xAux >= 0x100000000) {
+            xAux >>= 32;
+            result <<= 16;
+        }
+        if (xAux >= 0x10000) {
+            xAux >>= 16;
+            result <<= 8;
+        }
+        if (xAux >= 0x100) {
+            xAux >>= 8;
+            result <<= 4;
+        }
+        if (xAux >= 0x10) {
+            xAux >>= 4;
+            result <<= 2;
+        }
+        if (xAux >= 0x8) {
+            result <<= 1;
+        }
+
+        // The operations can never overflow because the result is max 2^127 when it enters this block.
+        unchecked {
+            result = (result + x / result) >> 1;
+            result = (result + x / result) >> 1;
+            result = (result + x / result) >> 1;
+            result = (result + x / result) >> 1;
+            result = (result + x / result) >> 1;
+            result = (result + x / result) >> 1;
+            result = (result + x / result) >> 1; // Seven iterations should be enough
+            uint256 roundedDownResult = x / result;
+            return result >= roundedDownResult ? roundedDownResult : result;
+        }
+    }
+
+    /// @notice from https://ethereum.stackexchange.com/questions/84390/absolute-value-in-solidity
+    function abs(int128 x) private pure returns (uint128) {
+        return x >= 0 ? uint128(x) : uint128(-x);
+    }
+
+    /// @notice Allow a user (who has already deposited collateral) to execute a leveraged trade
     function marginTrade(
         PoolKey memory key,
         int128 tradeAmount
     ) external payable {
-        // TODO - make sure collateral sufficient
+        removeLiquidity(key, tradeAmount);
 
-        // TODO - improve remove/restake logic - need to remove just enough to swap 'tradeAmount'
-
-        // Pull liquidity
-        // Restake liquidity (leaving some funds)
-        // Execute swawp
-
-        int24 tickLower = TickMath.minUsableTick(60);
-        int24 tickUpper = TickMath.maxUsableTick(60);
-        bytes memory ZERO_BYTES = new bytes(0);
-        modifyPosition(
-            key,
-            IPoolManager.ModifyPositionParams(tickLower, tickUpper, -3 ether),
-            ZERO_BYTES
-        );
-
-        // And now restake...
-        modifyPosition(
-            key,
-            IPoolManager.ModifyPositionParams(tickLower, tickUpper, 2 ether),
-            ZERO_BYTES
-        );
-
-        // And now execute swap...
-
-        // Copied from HookTest.sol
-        // uint160 MIN_PRICE_LIMIT = TickMath.MIN_SQRT_RATIO + 1;
-        // uint160 MAX_PRICE_LIMIT = TickMath.MAX_SQRT_RATIO - 1;
-        // int256 amountSpecified =
-        // bool zeroForOne = true;
+        bool zeroForOne = tradeAmount < 0 ? true : false;
         IPoolManager.SwapParams memory params = IPoolManager.SwapParams({
-            zeroForOne: true,
-            amountSpecified: 1 ether,
-            // sqrtPriceLimitX96: zeroForOne ? MIN_PRICE_LIMIT : MAX_PRICE_LIMIT // unlimited impact
-            sqrtPriceLimitX96: TickMath.MIN_SQRT_RATIO + 1
+            zeroForOne: zeroForOne,
+            amountSpecified: int128(abs(tradeAmount)),
+            sqrtPriceLimitX96: zeroForOne
+                ? TickMath.MIN_SQRT_RATIO + 1
+                : TickMath.MAX_SQRT_RATIO - 1 // unlimited impact
+            //sqrtPriceLimitX96: TickMath.MIN_SQRT_RATIO + 1
         });
 
         PoolSwapTest.TestSettings memory testSettings = PoolSwapTest
             .TestSettings({withdrawTokens: true, settleUsingTransfer: true});
 
-        TestERC20 token0 = TestERC20(Currency.unwrap(key.currency0));
-        TestERC20 token1 = TestERC20(Currency.unwrap(key.currency1));
-        token0.approve(address(swapRouter), 100 ether);
-        token1.approve(address(swapRouter), 100 ether);
+        // TODO - move swapRouter logic into this contract and we won't have to
+        // deal with the approvals, need to figure out how it can coexist with
+        // position manager logic though
+        {
+            TestERC20 token0 = TestERC20(Currency.unwrap(key.currency0));
+            TestERC20 token1 = TestERC20(Currency.unwrap(key.currency1));
+            token0.approve(address(swapRouter), 100 ether);
+            token1.approve(address(swapRouter), 100 ether);
+        }
         bytes memory hookData = new bytes(0);
-        swapRouter.swap(key, params, testSettings, hookData);
+        BalanceDelta delta = swapRouter.swap(
+            key,
+            params,
+            testSettings,
+            hookData
+        );
 
-        // TODO - how do we track positions?
-        //positions[id][msg.sender] += tradeAmount
+        // token1 amount is our trade size
+        // Assumes token1 will always be USDC - in reality we cannot make this
+        // assumption, even if all pairs have USDC it could be token0 or token1
+        uint128 amountUSDC = abs(delta.amount1());
+
+        // Remember - collateral is also in USDC
+        // Saying max 20x leverage - we'll liquidate at that point
+        PoolId id = key.toId();
+        uint collateral20x = collateral[id][msg.sender] * 20;
+
+        // Should we multiply by 10^x to get better precision?
+        uint ratio = collateral20x / amountUSDC;
+        // Saying 10x initial leverage requirement
+        // require(amountUSDC <= collateral20x / 2);
+        require(ratio >= 2, "Not enough collateral");
+
+        (uint160 slot0_sqrtPriceX96, int24 slot0_tick, , ) = poolManager
+            .getSlot0(id);
+
+        // sqrtPriceXs are uint160 - possible but unlikely this will overflow?
+        // Actually - when all liquidity is taken think sqrtPriceX96 goes to extreme
+        // In that case think it would overflow?
+        uint256 liqSqrtPriceX = sqrt(
+            (uint256(slot0_sqrtPriceX96) * uint256(slot0_sqrtPriceX96)) * ratio
+        );
+        // Should we store liquidation prices at tick level instead?
+        // TickMath.getTickAtSqrtRatio(uint160 sqrtPriceX96)
+
+        // TODO need to += instead of overwriting position so we can add to and close positions
+        //int256 positionNet = int256(tradeAmount) *
+        //    int256(int160(slot0_sqrtPriceX96));
+        levPositions[id][msg.sender] = LeveragedPosition(
+            tradeAmount,
+            int256(tradeAmount) * int256(int160(slot0_sqrtPriceX96))
+        );
+
+        // TODO - how can we track our liquidation prices in a way that
+        // makes it possible to perform liquidations?
+        // Need a priority queue or something for efficient checking
+        // But general form is {sqrtPriceX: [address, address...]}
+        // Think it would be vulnerable to attacks as we'd have to iterate over
+        // all the addresses to liquidate?
     }
 
     // -----------------------------------------------

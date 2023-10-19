@@ -26,9 +26,11 @@ contract PerpHook is BaseHook {
     using PoolIdLibrary for PoolKey;
     using CurrencyLibrary for Currency;
 
+    // By keeping track of result of swaps executed on behalf of user we can track profits
     struct LeveragedPosition {
-        int128 position;
-        int256 positionNet;
+        int128 position0;
+        int128 position1;
+        // int256 positionNet;
     }
 
     struct CallbackData {
@@ -52,11 +54,12 @@ contract PerpHook is BaseHook {
     // Track collateral amounts of users
     // Collateral is at pool level...
     // mapping(address => uint256 colAmount) public collateral;
-    mapping(PoolId => mapping(address => uint256 colAmount)) public collateral;
+    // Should collateral be an int just in case it goes negative?
+    mapping(PoolId => mapping(address => uint256)) public collateral;
     mapping(PoolId => mapping(address => LeveragedPosition))
         public levPositions;
 
-    mapping(PoolId => mapping(address => uint256 amount)) public lpAmounts;
+    mapping(PoolId => mapping(address => uint256)) public lpAmounts;
 
     // Only accepting one token as collateral for now, set to USDC by default
     address colTokenAddr;
@@ -99,6 +102,26 @@ contract PerpHook is BaseHook {
         // TODO - emit some event
     }
 
+    /// @notice If position is flat calculate profit and move it to collateral
+    ///
+    function profitToCollateral(PoolKey memory key) internal {
+        PoolId id = key.toId();
+        require(
+            levPositions[id][msg.sender].position0 == 0,
+            "Positions must be closed!"
+        );
+        if (levPositions[id][msg.sender].position1 > 0) {
+            collateral[id][msg.sender] += uint128(
+                levPositions[id][msg.sender].position1
+            );
+        } else {
+            collateral[id][msg.sender] += uint128(
+                -levPositions[id][msg.sender].position1
+            );
+        }
+        levPositions[id][msg.sender].position1 = 0;
+    }
+
     function withdrawCollateral(
         PoolKey memory key,
         uint256 withdrawAmount
@@ -107,7 +130,12 @@ contract PerpHook is BaseHook {
         require(collateral[id][msg.sender] >= withdrawAmount);
         // Disable withdrawals if they have an open position?
         require(
-            levPositions[id][msg.sender].position == 0,
+            levPositions[id][msg.sender].position0 == 0,
+            "Positions must be closed!"
+        );
+        // This should always be closed if position0 is closed, remove check to save gas?
+        require(
+            levPositions[id][msg.sender].position1 == 0,
             "Positions must be closed!"
         );
         collateral[id][msg.sender] -= withdrawAmount;
@@ -123,7 +151,7 @@ contract PerpHook is BaseHook {
         int128 liquidityDelta,
         int24 slot0_tick,
         uint160 slot0_sqrtPriceX96
-    ) internal returns (BalanceDelta result) {
+    ) internal pure returns (BalanceDelta result) {
         // NOTE - function assumes hookFees are 0,
         // if that changes need to add extra logic from Pool.sol function
         if (liquidityDelta != 0) {
@@ -241,7 +269,7 @@ contract PerpHook is BaseHook {
         int24 tickUpper,
         uint256 amount0Desired,
         uint256 amount1Desired
-    ) internal returns (uint128) {
+    ) internal pure returns (uint128) {
         // compute liquidity amount given some amount0 and amount1
         //(uint160 sqrtPriceX96, , , , , , ) = pool.slot0();
 
@@ -264,19 +292,22 @@ contract PerpHook is BaseHook {
         int24 tickUpper = TickMath.maxUsableTick(60);
 
         PoolId id = key.toId();
-        (uint160 slot0_sqrtPriceX96, int24 slot0_tick, , ) = poolManager
-            .getSlot0(id);
+        (uint160 slot0_sqrtPriceX96, , , ) = poolManager.getSlot0(id);
 
         uint256 amount0Desired;
         uint256 amount1Desired;
-        if (tradeAmount > 0) {
-            amount0Desired = uint128(tradeAmount);
-            // Note - can't set to 2**256-1 or it causes some kind of overflow
-            amount1Desired = 2 ** 64;
-        } else {
-            amount0Desired = 2 ** 64;
-            amount1Desired = uint128(-tradeAmount);
-        }
+        // tradeAmount is ALWAYS amount0?
+        // When we trade oneForZero will we get exact amount though?
+        amount0Desired = uint128(abs(tradeAmount));
+        amount1Desired = 2 ** 64;
+        // if (tradeAmount > 0) {
+        //     amount0Desired = uint128(tradeAmount);
+        //     // Note - can't set to 2**256-1 or it causes some kind of overflow
+        //     amount1Desired = 2 ** 64;
+        // } else {
+        //     amount0Desired = 2 ** 64;
+        //     amount1Desired = uint128(-tradeAmount);
+        // }
         // console2.log("GOT AMOUNTS");
 
         // FIgure out how much we have to remove to do the swap...
@@ -371,14 +402,25 @@ contract PerpHook is BaseHook {
     ) external payable {
         removeLiquidity(key, tradeAmount);
 
-        bool zeroForOne = tradeAmount < 0 ? true : false;
+        /*
+        We're expressing tradeAmount as the trade size in token0, where a positive
+        number represents a long position, while a negative number represents a
+        short position, but when actually executing we have to use the negative
+        number, since for the pool logic if we have:
+        zeroForOne = true
+        tradeAmount = 100 (or any positive number)
+        it means we'll swap 100 token0s for token1s, so this is actually SELLING token0
+        So when placing here, we want to invert tradeAmount so the logic matches
+        */
+        // bool zeroForOne = tradeAmount > 0 ? true : false;
+        bool zeroForOne = tradeAmount > 0 ? false : true;
+        //bool zeroForOne = true;
         IPoolManager.SwapParams memory params = IPoolManager.SwapParams({
             zeroForOne: zeroForOne,
-            amountSpecified: int128(abs(tradeAmount)),
+            amountSpecified: -tradeAmount,
             sqrtPriceLimitX96: zeroForOne
                 ? TickMath.MIN_SQRT_RATIO + 1
                 : TickMath.MAX_SQRT_RATIO - 1 // unlimited impact
-            //sqrtPriceLimitX96: TickMath.MIN_SQRT_RATIO + 1
         });
 
         PoolSwapTest.TestSettings memory testSettings = PoolSwapTest
@@ -400,6 +442,8 @@ contract PerpHook is BaseHook {
             testSettings,
             hookData
         );
+        // console2.log("DELTA0", delta.amount0());
+        // console2.log("DELTA1", delta.amount1());
 
         // token1 amount is our trade size
         // Assumes token1 will always be USDC - in reality we cannot make this
@@ -417,8 +461,7 @@ contract PerpHook is BaseHook {
         // require(amountUSDC <= collateral20x / 2);
         require(ratio >= 2, "Not enough collateral");
 
-        (uint160 slot0_sqrtPriceX96, int24 slot0_tick, , ) = poolManager
-            .getSlot0(id);
+        (uint160 slot0_sqrtPriceX96, , , ) = poolManager.getSlot0(id);
 
         // sqrtPriceXs are uint160 - possible but unlikely this will overflow?
         // Actually - when all liquidity is taken think sqrtPriceX96 goes to extreme
@@ -430,18 +473,14 @@ contract PerpHook is BaseHook {
         // Should we store liquidation prices at tick level instead?
         // TickMath.getTickAtSqrtRatio(uint160 sqrtPriceX96)
 
-        // TODO need to += instead of overwriting position so we can add to and close positions
-        //int256 positionNet = int256(tradeAmount) *
-        //    int256(int160(slot0_sqrtPriceX96));
-        // levPositions[id][msg.sender] = LeveragedPosition(
-        //     tradeAmount,
-        //     int256(tradeAmount) * int256(int160(slot0_sqrtPriceX96))
-        // );
+        // Track our positions
+        levPositions[id][msg.sender].position0 += delta.amount0();
+        levPositions[id][msg.sender].position1 += delta.amount1();
 
-        levPositions[id][msg.sender].position += tradeAmount;
-        levPositions[id][msg.sender].positionNet +=
-            int256(tradeAmount) *
-            int256(int160(slot0_sqrtPriceX96));
+        // If they've closed their position, calculate their profit and add to collateral
+        if (levPositions[id][msg.sender].position0 == 0) {
+            profitToCollateral(key);
+        }
 
         // TODO - how can we track our liquidation prices in a way that
         // makes it possible to perform liquidations?

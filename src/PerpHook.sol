@@ -56,6 +56,8 @@ contract PerpHook is BaseHook {
     mapping(PoolId => mapping(address => LeveragedPosition))
         public levPositions;
 
+    mapping(PoolId => mapping(address => uint256 amount)) public lpAmounts;
+
     // Only accepting one token as collateral for now, set to USDC by default
     address colTokenAddr;
 
@@ -103,6 +105,11 @@ contract PerpHook is BaseHook {
     ) external {
         PoolId id = key.toId();
         require(collateral[id][msg.sender] >= withdrawAmount);
+        // Disable withdrawals if they have an open position?
+        require(
+            levPositions[id][msg.sender].position == 0,
+            "Positions must be closed!"
+        );
         collateral[id][msg.sender] -= withdrawAmount;
         TestERC20(colTokenAddr).transfer(msg.sender, withdrawAmount);
         // TODO - emit some event
@@ -216,9 +223,15 @@ contract PerpHook is BaseHook {
         // BalanceDelta delta
         modifyPosition(
             key,
-            IPoolManager.ModifyPositionParams(tickLower, tickUpper, 3 ether),
+            IPoolManager.ModifyPositionParams(
+                tickLower,
+                tickUpper,
+                liquidityDelta
+            ),
             ZERO_BYTES
         );
+
+        lpAmounts[id][msg.sender] += uint128(liquidityDelta);
     }
 
     /// @notice Copied from uni-v3 LiquidityManagement.sol 'addLiquidity' function
@@ -264,6 +277,7 @@ contract PerpHook is BaseHook {
             amount0Desired = 2 ** 64;
             amount1Desired = uint128(-tradeAmount);
         }
+        // console2.log("GOT AMOUNTS");
 
         // FIgure out how much we have to remove to do the swap...
         uint256 liquidity = getLiquidityFromAmounts(
@@ -273,6 +287,7 @@ contract PerpHook is BaseHook {
             amount0Desired,
             amount1Desired
         );
+        // console2.log("LIQ", liquidity);
 
         bytes memory ZERO_BYTES = new bytes(0);
 
@@ -285,6 +300,8 @@ contract PerpHook is BaseHook {
             ),
             ZERO_BYTES
         );
+
+        // console2.log("MODIFIED");
     }
 
     /// @notice from https://ethereum.stackexchange.com/questions/2910/can-i-square-root-in-solidity
@@ -409,16 +426,22 @@ contract PerpHook is BaseHook {
         uint256 liqSqrtPriceX = sqrt(
             (uint256(slot0_sqrtPriceX96) * uint256(slot0_sqrtPriceX96)) * ratio
         );
+
         // Should we store liquidation prices at tick level instead?
         // TickMath.getTickAtSqrtRatio(uint160 sqrtPriceX96)
 
         // TODO need to += instead of overwriting position so we can add to and close positions
         //int256 positionNet = int256(tradeAmount) *
         //    int256(int160(slot0_sqrtPriceX96));
-        levPositions[id][msg.sender] = LeveragedPosition(
-            tradeAmount,
-            int256(tradeAmount) * int256(int160(slot0_sqrtPriceX96))
-        );
+        // levPositions[id][msg.sender] = LeveragedPosition(
+        //     tradeAmount,
+        //     int256(tradeAmount) * int256(int160(slot0_sqrtPriceX96))
+        // );
+
+        levPositions[id][msg.sender].position += tradeAmount;
+        levPositions[id][msg.sender].positionNet +=
+            int256(tradeAmount) *
+            int256(int160(slot0_sqrtPriceX96));
 
         // TODO - how can we track our liquidation prices in a way that
         // makes it possible to perform liquidations?

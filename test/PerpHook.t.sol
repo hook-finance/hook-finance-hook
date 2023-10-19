@@ -108,7 +108,7 @@ contract PerpHookTest is HookTest, Deployers, GasSnapshot {
         assertEq(perpHook.afterSwapCount(poolId), 1);
     }
 
-    function testAdjustCollateral() public {
+    function testDepositCollateral() public {
         uint256 depositAmount = 1 ether;
         // If we do not approve hook - this should fail!
         vm.expectRevert();
@@ -120,11 +120,37 @@ contract PerpHookTest is HookTest, Deployers, GasSnapshot {
         perpHook.depositCollateral(poolKey, depositAmount);
         uint256 balAfter = token1.balanceOf(address(this));
         assertEq(balBefore, balAfter + depositAmount);
+    }
+
+    function testWithdrawCollateral() public {
+        TestERC20 token0 = TestERC20(Currency.unwrap(poolKey.currency0));
+        TestERC20 token1 = TestERC20(Currency.unwrap(poolKey.currency1));
+
+        // First deposit...
+        uint256 depositAmount = 1 ether;
+        token1.approve(address(perpHook), depositAmount);
+        perpHook.depositCollateral(poolKey, depositAmount);
 
         // If we try to withdraw too much, it should fail
         vm.expectRevert();
         perpHook.withdrawCollateral(poolKey, depositAmount + 1 ether);
         // But withdrawing normal amount should work
+        perpHook.withdrawCollateral(poolKey, depositAmount);
+
+        // Add a position and make sure we can't withdraw with an open position...
+        token0.approve(address(perpHook), 100 ether);
+        token1.approve(address(perpHook), 100 ether);
+        perpHook.depositCollateral(poolKey, depositAmount);
+        // Need to mint before we can do a trade
+        perpHook.lpMint(poolKey, 10 ether);
+        perpHook.marginTrade(poolKey, -2 ether);
+
+        // open position so this should fail
+        vm.expectRevert();
+        perpHook.withdrawCollateral(poolKey, depositAmount);
+
+        // And how after closing trade we should be able to withdraw
+        perpHook.marginTrade(poolKey, 2 ether);
         perpHook.withdrawCollateral(poolKey, depositAmount);
     }
 

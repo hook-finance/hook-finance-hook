@@ -31,7 +31,8 @@ contract PerpHookTest is HookTest, Deployers, GasSnapshot {
 
         // Deploy the hook to an address with the correct flags
         uint160 flags = uint160(
-            Hooks.BEFORE_SWAP_FLAG |
+            Hooks.BEFORE_INITIALIZE_FLAG |
+                Hooks.BEFORE_SWAP_FLAG |
                 Hooks.AFTER_SWAP_FLAG |
                 Hooks.BEFORE_MODIFY_POSITION_FLAG |
                 Hooks.AFTER_MODIFY_POSITION_FLAG
@@ -88,24 +89,6 @@ contract PerpHookTest is HookTest, Deployers, GasSnapshot {
             ),
             ZERO_BYTES
         );
-    }
-
-    function disabledtestPerpHookHooks() public {
-        // positions were created in setup()
-        assertEq(perpHook.beforeModifyPositionCount(poolId), 3);
-        assertEq(perpHook.afterModifyPositionCount(poolId), 3);
-
-        assertEq(perpHook.beforeSwapCount(poolId), 0);
-        assertEq(perpHook.afterSwapCount(poolId), 0);
-
-        // Perform a test swap //
-        int256 amount = 100;
-        bool zeroForOne = true;
-        swap(poolKey, amount, zeroForOne, ZERO_BYTES);
-        // ------------------- //
-
-        assertEq(perpHook.beforeSwapCount(poolId), 1);
-        assertEq(perpHook.afterSwapCount(poolId), 1);
     }
 
     function testDepositCollateral() public {

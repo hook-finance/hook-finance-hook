@@ -30,7 +30,14 @@ contract PerpHook is BaseHook {
     struct LeveragedPosition {
         int128 position0;
         int128 position1;
+        uint256 startSwapMarginFeesPerUnit;
+        uint256 startSwapFundingFeesPerUnit;
         // int256 positionNet;
+    }
+
+    struct LPPosition {
+        uint256 liquidity;
+        uint256 startLpMarginFeesPerUnit;
     }
 
     struct CallbackData {
@@ -45,21 +52,33 @@ contract PerpHook is BaseHook {
     // a single hook contract should be able to service multiple pools
     // ---------------------------------------------------------------
 
-    mapping(PoolId => uint256 count) public beforeSwapCount;
-    mapping(PoolId => uint256 count) public afterSwapCount;
-
-    mapping(PoolId => uint256 count) public beforeModifyPositionCount;
-    mapping(PoolId => uint256 count) public afterModifyPositionCount;
-
     // Track collateral amounts of users
     // Collateral is at pool level...
     // mapping(address => uint256 colAmount) public collateral;
     // Should collateral be an int just in case it goes negative?
     mapping(PoolId => mapping(address => uint256)) public collateral;
+    // Profits from margin fees paid to LPs - will represent amount in USDC
+    mapping(PoolId => mapping(address => uint256)) public lpProfits;
     mapping(PoolId => mapping(address => LeveragedPosition))
         public levPositions;
 
-    mapping(PoolId => mapping(address => uint256)) public lpAmounts;
+    mapping(PoolId => mapping(address => LPPosition)) public lpPositions;
+
+    mapping(PoolId => uint256) public lastFundingTime;
+
+    // Absolute value of margin swaps, so if open positions are [-100, +200], should be 300
+    mapping(PoolId => uint256) public marginSwapsAbs;
+    // Net value of margin swaps, so if open positions are [-100, +200], should be -100
+    mapping(PoolId => int256) public marginSwapsNet;
+    // Need to keep track of how much liquidity LPs have deposited rather than how
+    // much there actually is, so we can properly credit margin payments
+    mapping(PoolId => uint256) public lpLiqTotal;
+    // keep track of margin fees owed to LPs
+    mapping(PoolId => uint256) public lpMarginFeesPerUnit;
+    // keep track of margin fees owed by swappers
+    mapping(PoolId => uint256) public swapMarginFeesPerUnit;
+    // keep track of funding fees owed between swappers
+    mapping(PoolId => uint256) public swapFundingFeesPerUnit;
 
     // Only accepting one token as collateral for now, set to USDC by default
     address colTokenAddr;
@@ -77,7 +96,7 @@ contract PerpHook is BaseHook {
     function getHooksCalls() public pure override returns (Hooks.Calls memory) {
         return
             Hooks.Calls({
-                beforeInitialize: false,
+                beforeInitialize: true,
                 afterInitialize: false,
                 beforeModifyPosition: true,
                 afterModifyPosition: true,
@@ -103,7 +122,6 @@ contract PerpHook is BaseHook {
     }
 
     /// @notice If position is flat calculate profit and move it to collateral
-    ///
     function profitToCollateral(PoolKey memory key) internal {
         PoolId id = key.toId();
         require(
@@ -214,6 +232,7 @@ contract PerpHook is BaseHook {
         int128 liquidityDelta
     ) external payable {
         require(liquidityDelta > 0, "Negative stakes not allowed!");
+
         bytes memory ZERO_BYTES = new bytes(0);
         // mint across entire range?
         int24 tickLower = TickMath.minUsableTick(60);
@@ -222,6 +241,12 @@ contract PerpHook is BaseHook {
         PoolId id = key.toId();
         (uint160 slot0_sqrtPriceX96, int24 slot0_tick, , ) = poolManager
             .getSlot0(id);
+
+        if (liquidityDelta > 0) {
+            lpLiqTotal[id] += uint128(liquidityDelta);
+        } else {
+            lpLiqTotal[id] -= uint128(-liquidityDelta);
+        }
 
         // Need to precompute balance deltas so we can take funds from LP to stake ourselves
         BalanceDelta deltaPred = getMintBalanceDelta(
@@ -259,7 +284,9 @@ contract PerpHook is BaseHook {
             ZERO_BYTES
         );
 
-        lpAmounts[id][msg.sender] += uint128(liquidityDelta);
+        lpPositions[id][msg.sender].liquidity += uint128(liquidityDelta);
+        lpPositions[id][msg.sender]
+            .startLpMarginFeesPerUnit = lpMarginFeesPerUnit[id];
     }
 
     /// @notice Copied from uni-v3 LiquidityManagement.sol 'addLiquidity' function
@@ -405,16 +432,13 @@ contract PerpHook is BaseHook {
         /*
         We're expressing tradeAmount as the trade size in token0, where a positive
         number represents a long position, while a negative number represents a
-        short position, but when actually executing we have to use the negative
-        number, since for the pool logic if we have:
+        short position, but when actually executing we have to use (-tradeAmount),
+        since for the pool logic if we have:
         zeroForOne = true
         tradeAmount = 100 (or any positive number)
         it means we'll swap 100 token0s for token1s, so this is actually SELLING token0
-        So when placing here, we want to invert tradeAmount so the logic matches
         */
-        // bool zeroForOne = tradeAmount > 0 ? true : false;
         bool zeroForOne = tradeAmount > 0 ? false : true;
-        //bool zeroForOne = true;
         IPoolManager.SwapParams memory params = IPoolManager.SwapParams({
             zeroForOne: zeroForOne,
             amountSpecified: -tradeAmount,
@@ -477,6 +501,11 @@ contract PerpHook is BaseHook {
         levPositions[id][msg.sender].position0 += delta.amount0();
         levPositions[id][msg.sender].position1 += delta.amount1();
 
+        levPositions[id][msg.sender]
+            .startSwapMarginFeesPerUnit = swapMarginFeesPerUnit[id];
+        levPositions[id][msg.sender]
+            .startSwapFundingFeesPerUnit = swapFundingFeesPerUnit[id];
+
         // If they've closed their position, calculate their profit and add to collateral
         if (levPositions[id][msg.sender].position0 == 0) {
             profitToCollateral(key);
@@ -490,9 +519,48 @@ contract PerpHook is BaseHook {
         // all the addresses to liquidate?
     }
 
+    function doFundingMarginPayments(PoolKey memory key) internal {
+        PoolId id = key.toId();
+
+        while (block.timestamp > lastFundingTime[id] + 3600) {
+            /*
+            margin fee:
+            10% annual on position size, charged hourly
+            365*24 = 8760 periods
+            So divide by 87600 every hour to get payment
+            1*10**18 / 87600 * 8760 = 1*10**17
+            */
+            uint marginPayment = marginSwapsAbs[id] / 87600;
+            if (marginPayment > 0) {
+                lpMarginFeesPerUnit[id] += marginPayment / lpLiqTotal[id];
+                swapMarginFeesPerUnit[id] += marginPayment / marginSwapsAbs[id];
+
+                // TODO - fix logic for funding...
+                uint fundingPayment = 1234;
+                swapFundingFeesPerUnit[id] +=
+                    fundingPayment /
+                    marginSwapsAbs[id];
+            }
+
+            lastFundingTime[id] += 3600;
+        }
+    }
+
     // -----------------------------------------------
     // NOTE: see IHooks.sol for function documentation
     // -----------------------------------------------
+
+    function beforeInitialize(
+        address,
+        PoolKey calldata key,
+        uint160,
+        bytes calldata
+    ) external override returns (bytes4) {
+        PoolId id = key.toId();
+        // Round down to nearest hour
+        lastFundingTime[id] = (block.timestamp / 60) * 60;
+        return BaseHook.beforeInitialize.selector;
+    }
 
     function beforeSwap(
         address,
@@ -500,7 +568,7 @@ contract PerpHook is BaseHook {
         IPoolManager.SwapParams calldata,
         bytes calldata
     ) external override returns (bytes4) {
-        beforeSwapCount[key.toId()]++;
+        doFundingMarginPayments(key);
         return BaseHook.beforeSwap.selector;
     }
 
@@ -511,7 +579,6 @@ contract PerpHook is BaseHook {
         BalanceDelta,
         bytes calldata
     ) external override returns (bytes4) {
-        afterSwapCount[key.toId()]++;
         return BaseHook.afterSwap.selector;
     }
 
@@ -521,7 +588,12 @@ contract PerpHook is BaseHook {
         IPoolManager.ModifyPositionParams calldata,
         bytes calldata
     ) external override returns (bytes4) {
-        beforeModifyPositionCount[key.toId()]++;
+        // TODO - enable this when we deploy, makes setup more challenging otherwise
+        // require(
+        //     msg.sender == address(this),
+        //     "Only hook can deposit liquidity!"
+        // );
+        doFundingMarginPayments(key);
         return BaseHook.beforeModifyPosition.selector;
     }
 
@@ -532,7 +604,6 @@ contract PerpHook is BaseHook {
         BalanceDelta,
         bytes calldata
     ) external override returns (bytes4) {
-        afterModifyPositionCount[key.toId()]++;
         return BaseHook.afterModifyPosition.selector;
     }
 

@@ -13,7 +13,6 @@ import {TickMath} from "@uniswap/v4-core/contracts/libraries/TickMath.sol";
 import {TestERC20} from "@uniswap/v4-core/contracts/test/TestERC20.sol";
 import {CurrencyLibrary, Currency} from "@uniswap/v4-core/contracts/types/Currency.sol";
 // import {Position} from "@uniswap/v4-core/contracts/libraries/Position.sol";
-import {PoolSwapTest} from "@uniswap/v4-core/contracts/test/PoolSwapTest.sol";
 import {SqrtPriceMath} from "@uniswap/v4-core/contracts/libraries/SqrtPriceMath.sol";
 import {SafeCast} from "@uniswap/v4-core/contracts/libraries/SafeCast.sol";
 // import {LiquidityAmounts} from "@uniswap/v4-periphery/contracts/libraries/LiquidityAmounts.sol";
@@ -39,11 +38,24 @@ contract PerpHook is BaseHook {
         uint256 startLpMarginFeesPerUnit;
     }
 
-    struct CallbackData {
+    struct CallbackDataModPos {
         address sender;
         PoolKey key;
         IPoolManager.ModifyPositionParams params;
         bytes hookData;
+    }
+
+    struct CallbackDataSwap {
+        address sender;
+        TestSettingsSwap testSettings;
+        PoolKey key;
+        IPoolManager.SwapParams params;
+        bytes hookData;
+    }
+
+    struct TestSettingsSwap {
+        bool withdrawTokens;
+        bool settleUsingTransfer;
     }
 
     // NOTE: ---------------------------------------------------------
@@ -79,10 +91,10 @@ contract PerpHook is BaseHook {
     // keep track of funding fees owed between swappers
     mapping(PoolId => int256) public swapFundingFeesPerUnit;
 
+    uint8 whichLock;
+
     // Only accepting one token as collateral for now, set to USDC by default
     address colTokenAddr;
-
-    PoolSwapTest swapRouter;
 
     event Mint(address indexed minter, int256 amount);
     event Burn(address indexed burner, int256 amount);
@@ -99,7 +111,7 @@ contract PerpHook is BaseHook {
         IPoolManager _poolManager,
         address _colTokenAddr
     ) BaseHook(_poolManager) {
-        swapRouter = new PoolSwapTest(_poolManager);
+        // swapRouter = new PoolSwapTest(_poolManager);
         colTokenAddr = _colTokenAddr;
     }
 
@@ -311,7 +323,6 @@ contract PerpHook is BaseHook {
             "Not enough liquidity!"
         );
 
-        bytes memory ZERO_BYTES = new bytes(0);
         // mint across entire range?
         int24 tickLower = TickMath.minUsableTick(60);
         int24 tickUpper = TickMath.maxUsableTick(60);
@@ -323,7 +334,7 @@ contract PerpHook is BaseHook {
                 tickUpper,
                 liquidityDelta
             ),
-            ZERO_BYTES
+            ""
         );
 
         lpLiqTotal[id] -= uint128(-liquidityDelta);
@@ -348,7 +359,6 @@ contract PerpHook is BaseHook {
     ) external payable {
         require(liquidityDelta > 0, "Negative stakes not allowed!");
 
-        bytes memory ZERO_BYTES = new bytes(0);
         // mint across entire range?
         int24 tickLower = TickMath.minUsableTick(60);
         int24 tickUpper = TickMath.maxUsableTick(60);
@@ -398,7 +408,7 @@ contract PerpHook is BaseHook {
                 tickUpper,
                 liquidityDelta
             ),
-            ZERO_BYTES
+            ""
         );
 
         lpPositions[id][msg.sender].liquidity += uint128(liquidityDelta);
@@ -466,8 +476,6 @@ contract PerpHook is BaseHook {
         );
         // console2.log("LIQ", liquidity);
 
-        bytes memory ZERO_BYTES = new bytes(0);
-
         modifyPosition(
             key,
             IPoolManager.ModifyPositionParams(
@@ -475,7 +483,7 @@ contract PerpHook is BaseHook {
                 tickUpper,
                 -int256(liquidity)
             ),
-            ZERO_BYTES
+            ""
         );
 
         // console2.log("MODIFIED");
@@ -565,20 +573,12 @@ contract PerpHook is BaseHook {
                 : TickMath.MAX_SQRT_RATIO - 1 // unlimited impact
         });
 
-        PoolSwapTest.TestSettings memory testSettings = PoolSwapTest
-            .TestSettings({withdrawTokens: true, settleUsingTransfer: true});
+        TestSettingsSwap memory testSettings = TestSettingsSwap({
+            withdrawTokens: true,
+            settleUsingTransfer: true
+        });
 
-        // TODO - move swapRouter logic into this contract and we won't have to
-        // deal with the approvals, need to figure out how it can coexist with
-        // position manager logic though
-        {
-            TestERC20 token0 = TestERC20(Currency.unwrap(key.currency0));
-            TestERC20 token1 = TestERC20(Currency.unwrap(key.currency1));
-            token0.approve(address(swapRouter), 100 ether);
-            token1.approve(address(swapRouter), 100 ether);
-        }
-        bytes memory hookData = new bytes(0);
-        delta = swapRouter.swap(key, params, testSettings, hookData);
+        delta = swap(key, params, testSettings, "");
     }
 
     /// @notice Allow a user (who has already deposited collateral) to execute a leveraged trade
@@ -733,9 +733,12 @@ contract PerpHook is BaseHook {
         IPoolManager.ModifyPositionParams memory params,
         bytes memory hookData
     ) internal returns (BalanceDelta delta) {
+        whichLock = 1;
         delta = abi.decode(
             poolManager.lock(
-                abi.encode(CallbackData(msg.sender, key, params, hookData))
+                abi.encode(
+                    CallbackDataModPos(msg.sender, key, params, hookData)
+                )
             ),
             (BalanceDelta)
         );
@@ -746,13 +749,163 @@ contract PerpHook is BaseHook {
         }
     }
 
-    /// @notice Copy/paste from PoolModifyPositionTest
+    /// @notice Copy/paste from PoolSwapTest - simplifies structure having it here
+    function swap(
+        PoolKey memory key,
+        IPoolManager.SwapParams memory params,
+        TestSettingsSwap memory testSettings,
+        bytes memory hookData
+    ) public payable returns (BalanceDelta delta) {
+        console2.log("CALLING SWAP...");
+        whichLock = 0;
+        delta = abi.decode(
+            poolManager.lock(
+                abi.encode(
+                    CallbackDataSwap(
+                        msg.sender,
+                        testSettings,
+                        key,
+                        params,
+                        hookData
+                    )
+                )
+            ),
+            (BalanceDelta)
+        );
+        console2.log("DONE SWAP...");
+
+        uint256 ethBalance = address(this).balance;
+        if (ethBalance > 0)
+            CurrencyLibrary.NATIVE.transfer(msg.sender, ethBalance);
+    }
+
     function lockAcquired(
         bytes calldata rawData
     ) external override returns (bytes memory) {
+        // Should always be one of these two?
+        console2.log("LOCK ACQUIRED...", whichLock);
+        if (whichLock == 0) {
+            console2.log("CALLING LOCK SWAP...");
+            return lockAcquiredSwap(rawData);
+        } else if (whichLock == 1) {
+            return lockAcquiredModPos(rawData);
+        }
+        revert("Bad lock!");
+    }
+
+    /// @notice Copy/paste from PoolSwapTest
+    function lockAcquiredSwap(
+        bytes calldata rawData
+    ) internal returns (bytes memory) {
         require(msg.sender == address(poolManager));
 
-        CallbackData memory data = abi.decode(rawData, (CallbackData));
+        CallbackDataSwap memory data = abi.decode(rawData, (CallbackDataSwap));
+
+        BalanceDelta delta = poolManager.swap(
+            data.key,
+            data.params,
+            data.hookData
+        );
+
+        if (data.params.zeroForOne) {
+            if (delta.amount0() > 0) {
+                if (data.testSettings.settleUsingTransfer) {
+                    if (data.key.currency0.isNative()) {
+                        poolManager.settle{value: uint128(delta.amount0())}(
+                            data.key.currency0
+                        );
+                    } else {
+                        TestERC20(Currency.unwrap(data.key.currency0))
+                            .transferFrom(
+                                data.sender,
+                                address(poolManager),
+                                uint128(delta.amount0())
+                            );
+                        poolManager.settle(data.key.currency0);
+                    }
+                } else {
+                    // the received hook on this transfer will burn the tokens
+                    poolManager.safeTransferFrom(
+                        data.sender,
+                        address(poolManager),
+                        uint256(uint160(Currency.unwrap(data.key.currency0))),
+                        uint128(delta.amount0()),
+                        ""
+                    );
+                }
+            }
+            if (delta.amount1() < 0) {
+                if (data.testSettings.withdrawTokens) {
+                    poolManager.take(
+                        data.key.currency1,
+                        data.sender,
+                        uint128(-delta.amount1())
+                    );
+                } else {
+                    poolManager.mint(
+                        data.key.currency1,
+                        data.sender,
+                        uint128(-delta.amount1())
+                    );
+                }
+            }
+        } else {
+            if (delta.amount1() > 0) {
+                if (data.testSettings.settleUsingTransfer) {
+                    if (data.key.currency1.isNative()) {
+                        poolManager.settle{value: uint128(delta.amount1())}(
+                            data.key.currency1
+                        );
+                    } else {
+                        TestERC20(Currency.unwrap(data.key.currency1))
+                            .transferFrom(
+                                data.sender,
+                                address(poolManager),
+                                uint128(delta.amount1())
+                            );
+                        poolManager.settle(data.key.currency1);
+                    }
+                } else {
+                    // the received hook on this transfer will burn the tokens
+                    poolManager.safeTransferFrom(
+                        data.sender,
+                        address(poolManager),
+                        uint256(uint160(Currency.unwrap(data.key.currency1))),
+                        uint128(delta.amount1()),
+                        ""
+                    );
+                }
+            }
+            if (delta.amount0() < 0) {
+                if (data.testSettings.withdrawTokens) {
+                    poolManager.take(
+                        data.key.currency0,
+                        data.sender,
+                        uint128(-delta.amount0())
+                    );
+                } else {
+                    poolManager.mint(
+                        data.key.currency0,
+                        data.sender,
+                        uint128(-delta.amount0())
+                    );
+                }
+            }
+        }
+
+        return abi.encode(delta);
+    }
+
+    /// @notice Copy/paste from PoolModifyPositionTest
+    function lockAcquiredModPos(
+        bytes calldata rawData
+    ) internal returns (bytes memory) {
+        require(msg.sender == address(poolManager));
+
+        CallbackDataModPos memory data = abi.decode(
+            rawData,
+            (CallbackDataModPos)
+        );
 
         BalanceDelta delta = poolManager.modifyPosition(
             data.key,

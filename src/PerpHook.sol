@@ -678,7 +678,7 @@ contract PerpHook is BaseHook {
     ) external override returns (bytes4) {
         PoolId id = key.toId();
         // Round down to nearest hour
-        lastFundingTime[id] = (block.timestamp / 60) * 60;
+        lastFundingTime[id] = (block.timestamp / (3600)) * 3600;
         return BaseHook.beforeInitialize.selector;
     }
 

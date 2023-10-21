@@ -250,8 +250,41 @@ contract PerpHook is BaseHook {
         }
     }
 
+    /// @notice Removes an LPs stake
     function lpBurn(PoolKey memory key, int128 liquidityDelta) external {
-        // TODO - implement, similar to mint logic
+        require(liquidityDelta < 0);
+        PoolId id = key.toId();
+        require(
+            lpPositions[id][msg.sender].liquidity >= uint128(-liquidityDelta),
+            "Not enough liquidity!"
+        );
+
+        bytes memory ZERO_BYTES = new bytes(0);
+        // mint across entire range?
+        int24 tickLower = TickMath.minUsableTick(60);
+        int24 tickUpper = TickMath.maxUsableTick(60);
+
+        BalanceDelta delta = modifyPosition(
+            key,
+            IPoolManager.ModifyPositionParams(
+                tickLower,
+                tickUpper,
+                liquidityDelta
+            ),
+            ZERO_BYTES
+        );
+
+        lpLiqTotal[id] -= uint128(-liquidityDelta);
+        lpPositions[id][msg.sender].liquidity -= uint128(liquidityDelta);
+        // TODO - call 'settle'?
+        lpPositions[id][msg.sender]
+            .startLpMarginFeesPerUnit = lpMarginFeesPerUnit[id];
+
+        TestERC20 token0 = TestERC20(Currency.unwrap(key.currency0));
+        TestERC20 token1 = TestERC20(Currency.unwrap(key.currency1));
+        // Return tokens to sender...
+        token0.transfer(msg.sender, uint128(delta.amount0()));
+        token1.transfer(msg.sender, uint128(delta.amount1()));
     }
 
     /// @notice Deposits funds to be used as both pool liquidity and funds to execute swaps
@@ -270,11 +303,13 @@ contract PerpHook is BaseHook {
         (uint160 slot0_sqrtPriceX96, int24 slot0_tick, , ) = poolManager
             .getSlot0(id);
 
-        if (liquidityDelta > 0) {
-            lpLiqTotal[id] += uint128(liquidityDelta);
-        } else {
-            lpLiqTotal[id] -= uint128(-liquidityDelta);
-        }
+        lpLiqTotal[id] += uint128(liquidityDelta);
+        // Must be gt 0
+        // if (liquidityDelta > 0) {
+        //     lpLiqTotal[id] += uint128(liquidityDelta);
+        // } else {
+        //     lpLiqTotal[id] -= uint128(-liquidityDelta);
+        // }
 
         // Need to precompute balance deltas so we can take funds from LP to stake ourselves
         BalanceDelta deltaPred = getMintBalanceDelta(

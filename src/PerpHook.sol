@@ -130,18 +130,34 @@ contract PerpHook is BaseHook {
     }
 
     /// @notice manage margin and funding payments for swappers
-    function settleSwappers() internal {
-        // Whenever we adjust a position we need to make sure starting fee values are correct
-        // TODO - need to implement
-        // LeveragedPosition
-        // uint256 startSwapMarginFeesPerUnit;
-        // uint256 startSwapFundingFeesPerUnit;
-        // uint256 startLpMarginFeesPerUnit;
+    function settleSwapper(PoolId id, address addrSwapper) internal {
+        uint256 marginFeesPerUnit = swapMarginFeesPerUnit[id] -
+            levPositions[id][addrSwapper].startSwapMarginFeesPerUnit;
+        uint256 marginPaid = marginFeesPerUnit *
+            abs(levPositions[id][addrSwapper].position0);
+
+        int256 fundingFeesPerUnit = swapFundingFeesPerUnit[id] -
+            levPositions[id][addrSwapper].startSwapFundingFeesPerUnit;
+        int256 fundingPaid = fundingFeesPerUnit *
+            levPositions[id][addrSwapper].position0;
+
+        collateral[id][addrSwapper] -= marginPaid;
+        if (fundingPaid > 0) {
+            collateral[id][addrSwapper] += uint256(fundingPaid);
+        } else {
+            collateral[id][addrSwapper] -= uint256(-fundingPaid);
+        }
     }
 
     /// @notice manage margin payments to LPs
-    function settleLp() internal {
-        // TODO - need to implement
+    function settleLP(PoolId id, address addrLP) internal {
+        // Need to add all their margin fees to profits
+        // so move current fees to profits...
+        uint marginFeesPerUnit = lpMarginFeesPerUnit[id] -
+            lpPositions[id][addrLP].startLpMarginFeesPerUnit;
+
+        uint lpProfit = marginFeesPerUnit * lpPositions[id][addrLP].liquidity;
+        lpProfits[id][addrLP] += lpProfit;
     }
 
     function liquidateSwapper(PoolKey calldata key, address liqSwapper) public {
@@ -153,6 +169,8 @@ contract PerpHook is BaseHook {
         BalanceDelta delta = execMarginTrade(key, tradeAmount);
         // This is the current position value
         int128 positionVal = delta.amount1();
+
+        settleSwapper(id, liqSwapper);
 
         uint256 swapperCol = collateral[id][liqSwapper];
         LeveragedPosition memory swapperPos = levPositions[id][liqSwapper];
@@ -244,8 +262,6 @@ contract PerpHook is BaseHook {
         );
         collateral[id][msg.sender] -= withdrawAmount;
         TestERC20(colTokenAddr).transfer(msg.sender, withdrawAmount);
-        // TODO - emit some event
-
         emit Withdraw(msg.sender, withdrawAmount);
     }
 
@@ -337,9 +353,10 @@ contract PerpHook is BaseHook {
             ""
         );
 
+        settleLP(id, msg.sender);
+
         lpLiqTotal[id] -= uint128(-liquidityDelta);
         lpPositions[id][msg.sender].liquidity -= uint128(liquidityDelta);
-        // TODO - call 'settle'?
         lpPositions[id][msg.sender]
             .startLpMarginFeesPerUnit = lpMarginFeesPerUnit[id];
 
@@ -347,7 +364,13 @@ contract PerpHook is BaseHook {
         TestERC20 token1 = TestERC20(Currency.unwrap(key.currency1));
         // Return tokens to sender...
         token0.transfer(msg.sender, uint128(delta.amount0()));
-        token1.transfer(msg.sender, uint128(delta.amount1()));
+
+        // Include margin fees in this transfer
+        token1.transfer(
+            msg.sender,
+            uint128(delta.amount1()) + lpProfits[id][msg.sender]
+        );
+        lpProfits[id][msg.sender] = 0;
 
         emit Burn(msg.sender, liquidityDelta);
     }
@@ -410,6 +433,10 @@ contract PerpHook is BaseHook {
             ),
             ""
         );
+
+        settleLP(id, msg.sender);
+
+        // Now that we've settled margin amounts we can adjust liquidity values
 
         lpPositions[id][msg.sender].liquidity += uint128(liquidityDelta);
         lpPositions[id][msg.sender]
@@ -588,6 +615,9 @@ contract PerpHook is BaseHook {
     ) external payable {
         BalanceDelta delta = execMarginTrade(key, tradeAmount);
 
+        PoolId id = key.toId();
+        settleSwapper(id, msg.sender);
+
         // console2.log("DELTA0", delta.amount0());
         // console2.log("DELTA1", delta.amount1());
 
@@ -598,7 +628,6 @@ contract PerpHook is BaseHook {
 
         // Remember - collateral is also in USDC
         // Saying max 20x leverage - we'll liquidate at that point
-        PoolId id = key.toId();
         uint collateral20x = collateral[id][msg.sender] * 20;
 
         // Should we multiply by 10^x to get better precision?

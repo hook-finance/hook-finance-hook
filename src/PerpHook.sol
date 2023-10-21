@@ -31,7 +31,7 @@ contract PerpHook is BaseHook {
         int128 position0;
         int128 position1;
         uint256 startSwapMarginFeesPerUnit;
-        uint256 startSwapFundingFeesPerUnit;
+        int256 startSwapFundingFeesPerUnit;
     }
 
     struct LPPosition {
@@ -77,7 +77,7 @@ contract PerpHook is BaseHook {
     // keep track of margin fees owed by swappers
     mapping(PoolId => uint256) public swapMarginFeesPerUnit;
     // keep track of funding fees owed between swappers
-    mapping(PoolId => uint256) public swapFundingFeesPerUnit;
+    mapping(PoolId => int256) public swapFundingFeesPerUnit;
 
     // Only accepting one token as collateral for now, set to USDC by default
     address colTokenAddr;
@@ -108,7 +108,9 @@ contract PerpHook is BaseHook {
 
     /// @notice manage margin and funding payments for swappers
     function settleSwappers() internal {
+        // Whenever we adjust a position we need to make sure starting fee values are correct
         // TODO - need to implement
+        // LeveragedPosition
         // uint256 startSwapMarginFeesPerUnit;
         // uint256 startSwapFundingFeesPerUnit;
         // uint256 startLpMarginFeesPerUnit;
@@ -598,11 +600,14 @@ contract PerpHook is BaseHook {
                 lpMarginFeesPerUnit[id] += marginPayment / lpLiqTotal[id];
                 swapMarginFeesPerUnit[id] += marginPayment / marginSwapsAbs[id];
 
-                // TODO - fix logic for funding...
-                uint fundingPayment = 1234;
-                swapFundingFeesPerUnit[id] +=
-                    fundingPayment /
-                    marginSwapsAbs[id];
+                int256 fundingPayment = marginSwapsNet[id] / 17520;
+                // Scale funding payment proportional to net long/short exposure
+                // 17520 = 50% max payment
+                // Note that this will be apply even if there's no
+                // other side of the trade?  What happens to the payment in the
+                // scenario where we have 1 position of +1000?
+                int256 payAdj = fundingPayment / marginSwapsNet[id];
+                swapFundingFeesPerUnit[id] += payAdj;
             }
 
             lastFundingTime[id] += 3600;

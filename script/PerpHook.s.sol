@@ -21,6 +21,7 @@ contract PerpHookScript is Script {
     function setUp() public {}
 
     function run() public {
+        // Hardcoded anvil default account private key
         vm.startBroadcast(
             0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
         );
@@ -30,9 +31,7 @@ contract PerpHookScript is Script {
         uint160 flags = uint160(
             Hooks.BEFORE_INITIALIZE_FLAG |
                 Hooks.BEFORE_SWAP_FLAG |
-                Hooks.AFTER_SWAP_FLAG |
-                Hooks.BEFORE_MODIFY_POSITION_FLAG |
-                Hooks.AFTER_MODIFY_POSITION_FLAG
+                Hooks.BEFORE_MODIFY_POSITION_FLAG
         );
 
         MockERC20 weth = new MockERC20(

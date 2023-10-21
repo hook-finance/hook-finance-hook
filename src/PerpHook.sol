@@ -121,9 +121,9 @@ contract PerpHook is BaseHook {
                 beforeInitialize: true,
                 afterInitialize: false,
                 beforeModifyPosition: true,
-                afterModifyPosition: true,
+                afterModifyPosition: false,
                 beforeSwap: true,
-                afterSwap: true,
+                afterSwap: false,
                 beforeDonate: false,
                 afterDonate: false
             });
@@ -721,16 +721,6 @@ contract PerpHook is BaseHook {
         return BaseHook.beforeSwap.selector;
     }
 
-    function afterSwap(
-        address,
-        PoolKey calldata key,
-        IPoolManager.SwapParams calldata,
-        BalanceDelta,
-        bytes calldata
-    ) external override returns (bytes4) {
-        return BaseHook.afterSwap.selector;
-    }
-
     function beforeModifyPosition(
         address,
         PoolKey calldata key,
@@ -744,16 +734,6 @@ contract PerpHook is BaseHook {
         // );
         doFundingMarginPayments(key);
         return BaseHook.beforeModifyPosition.selector;
-    }
-
-    function afterModifyPosition(
-        address,
-        PoolKey calldata key,
-        IPoolManager.ModifyPositionParams calldata,
-        BalanceDelta,
-        bytes calldata
-    ) external override returns (bytes4) {
-        return BaseHook.afterModifyPosition.selector;
     }
 
     /// @notice Copy/paste from PoolModifyPositionTest - we need it here because we want msg.sender to be our hook when we mint

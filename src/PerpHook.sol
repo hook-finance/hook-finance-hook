@@ -18,7 +18,7 @@ import {SafeCast} from "@uniswap/v4-core/contracts/libraries/SafeCast.sol";
 // import {LiquidityAmounts} from "@uniswap/v4-periphery/contracts/libraries/LiquidityAmounts.sol";
 import {LiquidityAmounts} from "lib/v4-periphery/contracts/libraries/LiquidityAmounts.sol";
 
-import "forge-std/console2.sol";
+// import "forge-std/console2.sol";
 
 contract PerpHook is BaseHook {
     using SafeCast for *;
@@ -483,15 +483,6 @@ contract PerpHook is BaseHook {
         // When we trade oneForZero will we get exact amount though?
         amount0Desired = uint128(abs(tradeAmount));
         amount1Desired = 2 ** 64;
-        // if (tradeAmount > 0) {
-        //     amount0Desired = uint128(tradeAmount);
-        //     // Note - can't set to 2**256-1 or it causes some kind of overflow
-        //     amount1Desired = 2 ** 64;
-        // } else {
-        //     amount0Desired = 2 ** 64;
-        //     amount1Desired = uint128(-tradeAmount);
-        // }
-        // console2.log("GOT AMOUNTS");
 
         // FIgure out how much we have to remove to do the swap...
         uint256 liquidity = getLiquidityFromAmounts(
@@ -501,7 +492,6 @@ contract PerpHook is BaseHook {
             amount0Desired,
             amount1Desired
         );
-        // console2.log("LIQ", liquidity);
 
         modifyPosition(
             key,
@@ -512,8 +502,6 @@ contract PerpHook is BaseHook {
             ),
             ""
         );
-
-        // console2.log("MODIFIED");
     }
 
     /// @notice from https://ethereum.stackexchange.com/questions/2910/can-i-square-root-in-solidity
@@ -618,9 +606,6 @@ contract PerpHook is BaseHook {
         PoolId id = key.toId();
         settleSwapper(id, msg.sender);
 
-        // console2.log("DELTA0", delta.amount0());
-        // console2.log("DELTA1", delta.amount1());
-
         // token1 amount is our trade size
         // Assumes token1 will always be USDC - in reality we cannot make this
         // assumption, even if all pairs have USDC it could be token0 or token1
@@ -636,14 +621,15 @@ contract PerpHook is BaseHook {
         // require(amountUSDC <= collateral20x / 2);
         require(ratio >= 2, "Not enough collateral");
 
-        (uint160 slot0_sqrtPriceX96, , , ) = poolManager.getSlot0(id);
+        // (uint160 slot0_sqrtPriceX96, , , ) = poolManager.getSlot0(id);
 
         // sqrtPriceXs are uint160 - possible but unlikely this will overflow?
         // Actually - when all liquidity is taken think sqrtPriceX96 goes to extreme
         // In that case think it would overflow?
-        uint256 liqSqrtPriceX = sqrt(
-            (uint256(slot0_sqrtPriceX96) * uint256(slot0_sqrtPriceX96)) * ratio
-        );
+        // Don't need this value if we rely on external liquidators
+        // uint256 liqSqrtPriceX = sqrt(
+        //     (uint256(slot0_sqrtPriceX96) * uint256(slot0_sqrtPriceX96)) * ratio
+        // );
 
         // Should we store liquidation prices at tick level instead?
         // TickMath.getTickAtSqrtRatio(uint160 sqrtPriceX96)
@@ -765,7 +751,6 @@ contract PerpHook is BaseHook {
         TestSettingsSwap memory testSettings,
         bytes memory hookData
     ) public payable returns (BalanceDelta delta) {
-        console2.log("CALLING SWAP...");
         whichLock = 0;
         delta = abi.decode(
             poolManager.lock(
@@ -781,7 +766,6 @@ contract PerpHook is BaseHook {
             ),
             (BalanceDelta)
         );
-        console2.log("DONE SWAP...");
 
         uint256 ethBalance = address(this).balance;
         if (ethBalance > 0)
@@ -792,9 +776,7 @@ contract PerpHook is BaseHook {
         bytes calldata rawData
     ) external override returns (bytes memory) {
         // Should always be one of these two?
-        console2.log("LOCK ACQUIRED...", whichLock);
         if (whichLock == 0) {
-            console2.log("CALLING LOCK SWAP...");
             return lockAcquiredSwap(rawData);
         } else if (whichLock == 1) {
             return lockAcquiredModPos(rawData);

@@ -84,6 +84,17 @@ contract PerpHook is BaseHook {
 
     PoolSwapTest swapRouter;
 
+    event Mint(address indexed minter, int256 amount);
+    event Burn(address indexed burner, int256 amount);
+    event Deposit(address indexed swapper, uint256 amount);
+    event Withdraw(address indexed swapper, uint256 amount);
+    event Trade(address indexed swapper, int256 amount);
+    event Liquidate(
+        address indexed liquidator,
+        address indexed swapper,
+        int256 amount
+    );
+
     constructor(
         IPoolManager _poolManager,
         address _colTokenAddr
@@ -163,6 +174,8 @@ contract PerpHook is BaseHook {
 
         // This should take care of calculating current swapper collateral
         profitToCollateral(key, liqSwapper);
+
+        emit Liquidate(msg.sender, liqSwapper, tradeAmount);
     }
 
     function depositCollateral(
@@ -176,7 +189,7 @@ contract PerpHook is BaseHook {
         );
         PoolId id = key.toId();
         collateral[id][msg.sender] += depositAmount;
-        // TODO - emit some event
+        emit Deposit(msg.sender, depositAmount);
     }
 
     /// @notice If position is flat calculate profit and move it to collateral
@@ -220,6 +233,8 @@ contract PerpHook is BaseHook {
         collateral[id][msg.sender] -= withdrawAmount;
         TestERC20(colTokenAddr).transfer(msg.sender, withdrawAmount);
         // TODO - emit some event
+
+        emit Withdraw(msg.sender, withdrawAmount);
     }
 
     /// @notice Copy/paste from 'modifyPosition' function in Pool.sol, needed so we can transfer funds from LP to stake ourselves
@@ -322,6 +337,8 @@ contract PerpHook is BaseHook {
         // Return tokens to sender...
         token0.transfer(msg.sender, uint128(delta.amount0()));
         token1.transfer(msg.sender, uint128(delta.amount1()));
+
+        emit Burn(msg.sender, liquidityDelta);
     }
 
     /// @notice Deposits funds to be used as both pool liquidity and funds to execute swaps
@@ -387,6 +404,8 @@ contract PerpHook is BaseHook {
         lpPositions[id][msg.sender].liquidity += uint128(liquidityDelta);
         lpPositions[id][msg.sender]
             .startLpMarginFeesPerUnit = lpMarginFeesPerUnit[id];
+
+        emit Mint(msg.sender, liquidityDelta);
     }
 
     /// @notice Copied from uni-v3 LiquidityManagement.sol 'addLiquidity' function
@@ -614,12 +633,7 @@ contract PerpHook is BaseHook {
             profitToCollateral(key, msg.sender);
         }
 
-        // TODO - how can we track our liquidation prices in a way that
-        // makes it possible to perform liquidations?
-        // Need a priority queue or something for efficient checking
-        // But general form is {sqrtPriceX: [address, address...]}
-        // Think it would be vulnerable to attacks as we'd have to iterate over
-        // all the addresses to liquidate?
+        emit Trade(msg.sender, tradeAmount);
     }
 
     function doFundingMarginPayments(PoolKey memory key) internal {

@@ -32,7 +32,6 @@ contract PerpHook is BaseHook {
         int128 position1;
         uint256 startSwapMarginFeesPerUnit;
         uint256 startSwapFundingFeesPerUnit;
-        // int256 positionNet;
     }
 
     struct LPPosition {
@@ -105,6 +104,31 @@ contract PerpHook is BaseHook {
                 beforeDonate: false,
                 afterDonate: false
             });
+    }
+
+    /// @notice manage margin and funding payments for swappers
+    function settleSwappers() internal {
+        // TODO - need to implement
+        // uint256 startSwapMarginFeesPerUnit;
+        // uint256 startSwapFundingFeesPerUnit;
+        // uint256 startLpMarginFeesPerUnit;
+    }
+
+    /// @notice manage margin payments to LPs
+    function settleLp() internal {
+        // TODO - need to implement
+    }
+
+    function liquidateSwapper(PoolKey calldata key, address liqSwapper) public {
+        PoolId id = key.toId();
+        uint256 swapperCol = collateral[id][liqSwapper];
+        LeveragedPosition memory swapperPos = levPositions[id][liqSwapper];
+        // TODO - check (externally using oracle?) to see if we have sufficient liquidity
+
+        // int128 position0;
+        // int128 position1;
+        // uint256 startSwapMarginFeesPerUnit;
+        // uint256 startSwapFundingFeesPerUnit;
     }
 
     function depositCollateral(
@@ -224,6 +248,10 @@ contract PerpHook is BaseHook {
                     );
             }
         }
+    }
+
+    function lpBurn(PoolKey memory key, int128 liquidityDelta) external {
+        // TODO - implement, similar to mint logic
     }
 
     /// @notice Deposits funds to be used as both pool liquidity and funds to execute swaps

@@ -21,11 +21,12 @@ contract PerpHookScript is Script {
     function setUp() public {}
 
     function run() public {
-        // Hardcoded anvil default account private key
-        uint privateKey = 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80;
+        uint privateKey = vm.envUint("PRIVATE_KEY");
 
         vm.startBroadcast(privateKey);
-        PoolManager manager = new PoolManager(500000);
+
+        // PoolManager manager = new PoolManager(500000);
+        address addrManager = 0x64255ed21366DB43d89736EE48928b890A84E2Cb;
 
         // hook contracts must have specific flags encoded in the address
         uint160 flags = uint160(
@@ -49,13 +50,12 @@ contract PerpHookScript is Script {
             flags,
             1000,
             type(PerpHook).creationCode,
-            abi.encode(address(manager), _colTokenAddr)
+            abi.encode(addrManager, _colTokenAddr)
         );
 
         // Deploy the hook using CREATE2
-
         PerpHook perpHook = new PerpHook{salt: salt}(
-            IPoolManager(address(manager)),
+            IPoolManager(addrManager),
             _colTokenAddr
         );
         require(
@@ -63,16 +63,9 @@ contract PerpHookScript is Script {
             "PerpHookScript: hook address mismatch"
         );
 
-        // Additional helpers for interacting with the pool
-        //vm.startBroadcast();
-        //new PoolModifyPositionTest(IPoolManager(address(manager)));
-        //new PoolSwapTest(IPoolManager(address(manager)));
-        //new PoolDonateTest(IPoolManager(address(manager)));
-        //vm.stopBroadcast();
-
         vm.stopBroadcast();
     }
 }
 
-// anvil --code-size-limit 30000
-// forge script script/PerpHook.s.sol:PerpHookScript --fork-url http://localhost:8545 --broadcast
+// forge script script/PerpHookSepolia.s.sol:PerpHookScript --rpc-url $SEPOLIA_RPC_URL
+// forge script script/PerpHookSepolia.s.sol:PerpHookScript --rpc-url $SEPOLIA_RPC_URL --broadcast --verify

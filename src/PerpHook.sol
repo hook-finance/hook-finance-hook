@@ -123,14 +123,46 @@ contract PerpHook is BaseHook {
 
     function liquidateSwapper(PoolKey calldata key, address liqSwapper) public {
         PoolId id = key.toId();
+
+        // We can just execute the swap and confirm that it was a valid liquidation
+        // based on amounts post-swap, and revert if it's invalid
+        int128 tradeAmount = -levPositions[id][liqSwapper].position0;
+        BalanceDelta delta = execMarginTrade(key, tradeAmount);
+        // This is the current position value
+        int128 positionVal = delta.amount1();
+
         uint256 swapperCol = collateral[id][liqSwapper];
         LeveragedPosition memory swapperPos = levPositions[id][liqSwapper];
-        // TODO - check (externally using oracle?) to see if we have sufficient liquidity
+        int128 profit = positionVal - swapperPos.position1;
 
-        // int128 position0;
-        // int128 position1;
-        // uint256 startSwapMarginFeesPerUnit;
-        // uint256 startSwapFundingFeesPerUnit;
+        uint remainingCollateral;
+        if (profit < 0) {
+            remainingCollateral = swapperCol - uint128(-profit);
+        } else {
+            remainingCollateral = swapperCol + uint128(profit);
+        }
+
+        // Must be greater than 20x leverage in order to liquidate!
+        require(
+            abs(positionVal) / remainingCollateral > 20,
+            "Invalid liquidation!"
+        );
+
+        // Pay a fee to the liquidator
+        uint256 liqFee = remainingCollateral / 20;
+        TestERC20(colTokenAddr).transfer(msg.sender, liqFee);
+
+        // And do position accounting
+        levPositions[id][liqSwapper].position0 += delta.amount0();
+        levPositions[id][liqSwapper].position1 += delta.amount1();
+
+        levPositions[id][liqSwapper]
+            .startSwapMarginFeesPerUnit = swapMarginFeesPerUnit[id];
+        levPositions[id][liqSwapper]
+            .startSwapFundingFeesPerUnit = swapFundingFeesPerUnit[id];
+
+        // This should take care of calculating current swapper collateral
+        profitToCollateral(key, liqSwapper);
     }
 
     function depositCollateral(
@@ -148,22 +180,25 @@ contract PerpHook is BaseHook {
     }
 
     /// @notice If position is flat calculate profit and move it to collateral
-    function profitToCollateral(PoolKey memory key) internal {
+    function profitToCollateral(
+        PoolKey memory key,
+        address addrSwapper
+    ) internal {
         PoolId id = key.toId();
         require(
-            levPositions[id][msg.sender].position0 == 0,
+            levPositions[id][addrSwapper].position0 == 0,
             "Positions must be closed!"
         );
-        if (levPositions[id][msg.sender].position1 > 0) {
-            collateral[id][msg.sender] += uint128(
-                levPositions[id][msg.sender].position1
+        if (levPositions[id][addrSwapper].position1 > 0) {
+            collateral[id][addrSwapper] += uint128(
+                levPositions[id][addrSwapper].position1
             );
         } else {
-            collateral[id][msg.sender] += uint128(
-                -levPositions[id][msg.sender].position1
+            collateral[id][addrSwapper] += uint128(
+                -levPositions[id][addrSwapper].position1
             );
         }
-        levPositions[id][msg.sender].position1 = 0;
+        levPositions[id][addrSwapper].position1 = 0;
     }
 
     function withdrawCollateral(
@@ -487,11 +522,10 @@ contract PerpHook is BaseHook {
         return x >= 0 ? uint128(x) : uint128(-x);
     }
 
-    /// @notice Allow a user (who has already deposited collateral) to execute a leveraged trade
-    function marginTrade(
+    function execMarginTrade(
         PoolKey memory key,
         int128 tradeAmount
-    ) external payable {
+    ) internal returns (BalanceDelta delta) {
         removeLiquidity(key, tradeAmount);
 
         /*
@@ -525,12 +559,16 @@ contract PerpHook is BaseHook {
             token1.approve(address(swapRouter), 100 ether);
         }
         bytes memory hookData = new bytes(0);
-        BalanceDelta delta = swapRouter.swap(
-            key,
-            params,
-            testSettings,
-            hookData
-        );
+        delta = swapRouter.swap(key, params, testSettings, hookData);
+    }
+
+    /// @notice Allow a user (who has already deposited collateral) to execute a leveraged trade
+    function marginTrade(
+        PoolKey memory key,
+        int128 tradeAmount
+    ) external payable {
+        BalanceDelta delta = execMarginTrade(key, tradeAmount);
+
         // console2.log("DELTA0", delta.amount0());
         // console2.log("DELTA1", delta.amount1());
 
@@ -573,7 +611,7 @@ contract PerpHook is BaseHook {
 
         // If they've closed their position, calculate their profit and add to collateral
         if (levPositions[id][msg.sender].position0 == 0) {
-            profitToCollateral(key);
+            profitToCollateral(key, msg.sender);
         }
 
         // TODO - how can we track our liquidation prices in a way that

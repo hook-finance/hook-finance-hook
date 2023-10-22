@@ -18,6 +18,9 @@ import {SafeCast} from "@uniswap/v4-core/contracts/libraries/SafeCast.sol";
 // import {LiquidityAmounts} from "@uniswap/v4-periphery/contracts/libraries/LiquidityAmounts.sol";
 import {LiquidityAmounts} from "lib/v4-periphery/contracts/libraries/LiquidityAmounts.sol";
 
+import "./IchainlinkPricer.sol";
+import "./chainlinkPricer.sol";
+
 // import "forge-std/console2.sol";
 
 contract PerpHook is BaseHook {
@@ -96,6 +99,9 @@ contract PerpHook is BaseHook {
     // Only accepting one token as collateral for now, set to USDC by default
     address colTokenAddr;
 
+    // price Feed
+    IChainlinkPricerETHUSDC chainlinkPricerETHUSDC;
+
     event Mint(address indexed minter, int256 amount);
     event Burn(address indexed burner, int256 amount);
     event Deposit(address indexed swapper, uint256 amount);
@@ -109,10 +115,12 @@ contract PerpHook is BaseHook {
 
     constructor(
         IPoolManager _poolManager,
-        address _colTokenAddr
+        address _colTokenAddr,
+        address priceFeed
     ) BaseHook(_poolManager) {
         // swapRouter = new PoolSwapTest(_poolManager);
         colTokenAddr = _colTokenAddr;
+        chainlinkPricer = new chainlinkPricer(priceFeed);
     }
 
     function getHooksCalls() public pure override returns (Hooks.Calls memory) {
@@ -271,9 +279,9 @@ contract PerpHook is BaseHook {
         int24 tickUpper,
         //int256 liquidityDelta,
         int128 liquidityDelta,
-        int24 slot0_tick,
-        uint160 slot0_sqrtPriceX96
+        int24 slot0_tick
     ) internal pure returns (BalanceDelta result) {
+        uint160 slot0_sqrtPriceX96 = chainlinkPricer.getPriceSquareRoot();
         // NOTE - function assumes hookFees are 0,
         // if that changes need to add extra logic from Pool.sol function
         if (liquidityDelta != 0) {
@@ -387,9 +395,9 @@ contract PerpHook is BaseHook {
         int24 tickUpper = TickMath.maxUsableTick(60);
 
         PoolId id = key.toId();
-        (uint160 slot0_sqrtPriceX96, int24 slot0_tick, , ) = poolManager
+        (, int24 slot0_tick, , ) = poolManager
             .getSlot0(id);
-
+        uint160 slot0_sqrtPriceX96 = chainlinkPricer.getPriceSquareRoot();
         lpLiqTotal[id] += uint128(liquidityDelta);
         // Must be gt 0
         // if (liquidityDelta > 0) {
@@ -447,15 +455,15 @@ contract PerpHook is BaseHook {
 
     /// @notice Copied from uni-v3 LiquidityManagement.sol 'addLiquidity' function
     function getLiquidityFromAmounts(
-        uint160 sqrtPriceX96,
         int24 tickLower,
         int24 tickUpper,
         uint256 amount0Desired,
         uint256 amount1Desired
     ) internal pure returns (uint128) {
         // compute liquidity amount given some amount0 and amount1
-        //(uint160 sqrtPriceX96, , , , , , ) = pool.slot0();
+        uint160 sqrtPriceX96 = chainlinkPricer.getPriceSquareRoot();
 
+        // TODO: Do we need to override this?
         uint160 sqrtRatioAX96 = TickMath.getSqrtRatioAtTick(tickLower);
         uint160 sqrtRatioBX96 = TickMath.getSqrtRatioAtTick(tickUpper);
 
@@ -475,7 +483,7 @@ contract PerpHook is BaseHook {
         int24 tickUpper = TickMath.maxUsableTick(60);
 
         PoolId id = key.toId();
-        (uint160 slot0_sqrtPriceX96, , , ) = poolManager.getSlot0(id);
+        uint160 slot0_sqrtPriceX96 = chainlinkPricer.getPriceSquareRoot();
 
         uint256 amount0Desired;
         uint256 amount1Desired;

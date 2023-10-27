@@ -2,27 +2,19 @@
 pragma solidity ^0.8.19;
 
 import {BaseHook} from "v4-periphery/BaseHook.sol";
-
-import {Hooks} from "@uniswap/v4-core/contracts/libraries/Hooks.sol";
 import {IPoolManager} from "@uniswap/v4-core/contracts/interfaces/IPoolManager.sol";
 import {PoolKey} from "@uniswap/v4-core/contracts/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/contracts/types/PoolId.sol";
-import {BalanceDelta, toBalanceDelta} from "@uniswap/v4-core/contracts/types/BalanceDelta.sol";
-import {PoolModifyPositionTest} from "@uniswap/v4-core/contracts/test/PoolModifyPositionTest.sol";
+import {BalanceDelta} from "@uniswap/v4-core/contracts/types/BalanceDelta.sol";
 import {TickMath} from "@uniswap/v4-core/contracts/libraries/TickMath.sol";
 import {TestERC20} from "@uniswap/v4-core/contracts/test/TestERC20.sol";
 import {CurrencyLibrary, Currency} from "@uniswap/v4-core/contracts/types/Currency.sol";
-// import {Position} from "@uniswap/v4-core/contracts/libraries/Position.sol";
-import {SqrtPriceMath} from "@uniswap/v4-core/contracts/libraries/SqrtPriceMath.sol";
-import {SafeCast} from "@uniswap/v4-core/contracts/libraries/SafeCast.sol";
-// import {LiquidityAmounts} from "@uniswap/v4-periphery/contracts/libraries/LiquidityAmounts.sol";
-import {LiquidityAmounts} from "lib/v4-periphery/contracts/libraries/LiquidityAmounts.sol";
 import {PoolCallsHook} from "./PoolCallsHook.sol";
+import {UniHelpers} from "./UniHelpers.sol";
 
 // import "forge-std/console2.sol";
 
 contract PerpHook is PoolCallsHook {
-    using SafeCast for *;
     using PoolIdLibrary for PoolKey;
     using CurrencyLibrary for Currency;
 
@@ -299,7 +291,7 @@ contract PerpHook is PoolCallsHook {
         // }
 
         // Need to precompute balance deltas so we can take funds from LP to stake ourselves
-        BalanceDelta deltaPred = getMintBalanceDelta(
+        BalanceDelta deltaPred = UniHelpers.getMintBalanceDelta(
             tickLower,
             tickUpper,
             liquidityDelta,
@@ -524,7 +516,7 @@ contract PerpHook is PoolCallsHook {
         amount1Desired = 2 ** 64;
 
         // FIgure out how much we have to remove to do the swap...
-        uint256 liquidity = getLiquidityFromAmounts(
+        uint256 liquidity = UniHelpers.getLiquidityFromAmounts(
             slot0_sqrtPriceX96,
             tickLower,
             tickUpper,
@@ -541,94 +533,5 @@ contract PerpHook is PoolCallsHook {
             ),
             ""
         );
-    }
-
-    /// @notice Copied from uni-v3 LiquidityManagement.sol 'addLiquidity' function
-    function getLiquidityFromAmounts(
-        uint160 sqrtPriceX96,
-        int24 tickLower,
-        int24 tickUpper,
-        uint256 amount0Desired,
-        uint256 amount1Desired
-    ) internal pure returns (uint128) {
-        // compute liquidity amount given some amount0 and amount1
-        //(uint160 sqrtPriceX96, , , , , , ) = pool.slot0();
-
-        uint160 sqrtRatioAX96 = TickMath.getSqrtRatioAtTick(tickLower);
-        uint160 sqrtRatioBX96 = TickMath.getSqrtRatioAtTick(tickUpper);
-
-        uint128 liquidity = LiquidityAmounts.getLiquidityForAmounts(
-            sqrtPriceX96,
-            sqrtRatioAX96,
-            sqrtRatioBX96,
-            amount0Desired,
-            amount1Desired
-        );
-        return liquidity;
-    }
-
-    /// @notice Copy/paste from 'modifyPosition' function in Pool.sol, needed so we can transfer funds from LP to stake ourselves
-    function getMintBalanceDelta(
-        int24 tickLower,
-        int24 tickUpper,
-        //int256 liquidityDelta,
-        int128 liquidityDelta,
-        int24 slot0_tick,
-        uint160 slot0_sqrtPriceX96
-    ) internal pure returns (BalanceDelta result) {
-        // NOTE - function assumes hookFees are 0,
-        // if that changes need to add extra logic from Pool.sol function
-        if (liquidityDelta != 0) {
-            if (slot0_tick < tickLower) {
-                // current tick is below the passed range; liquidity can only become in range by crossing from left to
-                // right, when we'll need _more_ currency0 (it's becoming more valuable) so user must provide it
-                result =
-                    result +
-                    toBalanceDelta(
-                        SqrtPriceMath
-                            .getAmount0Delta(
-                                TickMath.getSqrtRatioAtTick(tickLower),
-                                TickMath.getSqrtRatioAtTick(tickUpper),
-                                liquidityDelta
-                            )
-                            .toInt128(),
-                        0
-                    );
-            } else if (slot0_tick < tickUpper) {
-                result =
-                    result +
-                    toBalanceDelta(
-                        SqrtPriceMath
-                            .getAmount0Delta(
-                                slot0_sqrtPriceX96,
-                                TickMath.getSqrtRatioAtTick(tickUpper),
-                                liquidityDelta
-                            )
-                            .toInt128(),
-                        SqrtPriceMath
-                            .getAmount1Delta(
-                                TickMath.getSqrtRatioAtTick(tickLower),
-                                slot0_sqrtPriceX96,
-                                liquidityDelta
-                            )
-                            .toInt128()
-                    );
-            } else {
-                // current tick is above the passed range; liquidity can only become in range by crossing from right to
-                // left, when we'll need _more_ currency1 (it's becoming more valuable) so user must provide it
-                result =
-                    result +
-                    toBalanceDelta(
-                        0,
-                        SqrtPriceMath
-                            .getAmount1Delta(
-                                TickMath.getSqrtRatioAtTick(tickLower),
-                                TickMath.getSqrtRatioAtTick(tickUpper),
-                                liquidityDelta
-                            )
-                            .toInt128()
-                    );
-            }
-        }
     }
 }

@@ -17,10 +17,11 @@ import {SqrtPriceMath} from "@uniswap/v4-core/contracts/libraries/SqrtPriceMath.
 import {SafeCast} from "@uniswap/v4-core/contracts/libraries/SafeCast.sol";
 // import {LiquidityAmounts} from "@uniswap/v4-periphery/contracts/libraries/LiquidityAmounts.sol";
 import {LiquidityAmounts} from "lib/v4-periphery/contracts/libraries/LiquidityAmounts.sol";
+import {PoolCallsHook} from "./PoolCallsHook.sol";
 
 // import "forge-std/console2.sol";
 
-contract PerpHook is BaseHook {
+contract PerpHook is PoolCallsHook {
     using SafeCast for *;
     using PoolIdLibrary for PoolKey;
     using CurrencyLibrary for Currency;
@@ -36,26 +37,6 @@ contract PerpHook is BaseHook {
     struct LPPosition {
         uint256 liquidity;
         uint256 startLpMarginFeesPerUnit;
-    }
-
-    struct CallbackDataModPos {
-        address sender;
-        PoolKey key;
-        IPoolManager.ModifyPositionParams params;
-        bytes hookData;
-    }
-
-    struct CallbackDataSwap {
-        address sender;
-        TestSettingsSwap testSettings;
-        PoolKey key;
-        IPoolManager.SwapParams params;
-        bytes hookData;
-    }
-
-    struct TestSettingsSwap {
-        bool withdrawTokens;
-        bool settleUsingTransfer;
     }
 
     // NOTE: ---------------------------------------------------------
@@ -91,8 +72,6 @@ contract PerpHook is BaseHook {
     // keep track of funding fees owed between swappers
     mapping(PoolId => int256) public swapFundingFeesPerUnit;
 
-    uint8 whichLock;
-
     // Only accepting one token as collateral for now, set to USDC by default
     address colTokenAddr;
 
@@ -110,23 +89,9 @@ contract PerpHook is BaseHook {
     constructor(
         IPoolManager _poolManager,
         address _colTokenAddr
-    ) BaseHook(_poolManager) {
+    ) PoolCallsHook(_poolManager) {
         // swapRouter = new PoolSwapTest(_poolManager);
         colTokenAddr = _colTokenAddr;
-    }
-
-    function getHooksCalls() public pure override returns (Hooks.Calls memory) {
-        return
-            Hooks.Calls({
-                beforeInitialize: true,
-                afterInitialize: false,
-                beforeModifyPosition: true,
-                afterModifyPosition: false,
-                beforeSwap: true,
-                afterSwap: false,
-                beforeDonate: false,
-                afterDonate: false
-            });
     }
 
     /// @notice manage margin and funding payments for swappers
@@ -222,28 +187,6 @@ contract PerpHook is BaseHook {
         emit Deposit(msg.sender, depositAmount);
     }
 
-    /// @notice If position is flat calculate profit and move it to collateral
-    function profitToCollateral(
-        PoolKey memory key,
-        address addrSwapper
-    ) internal {
-        PoolId id = key.toId();
-        require(
-            levPositions[id][addrSwapper].position0 == 0,
-            "Positions must be closed!"
-        );
-        if (levPositions[id][addrSwapper].position1 > 0) {
-            collateral[id][addrSwapper] += uint128(
-                levPositions[id][addrSwapper].position1
-            );
-        } else {
-            collateral[id][addrSwapper] += uint128(
-                -levPositions[id][addrSwapper].position1
-            );
-        }
-        levPositions[id][addrSwapper].position1 = 0;
-    }
-
     function withdrawCollateral(
         PoolKey memory key,
         uint256 withdrawAmount
@@ -265,69 +208,26 @@ contract PerpHook is BaseHook {
         emit Withdraw(msg.sender, withdrawAmount);
     }
 
-    /// @notice Copy/paste from 'modifyPosition' function in Pool.sol, needed so we can transfer funds from LP to stake ourselves
-    function getMintBalanceDelta(
-        int24 tickLower,
-        int24 tickUpper,
-        //int256 liquidityDelta,
-        int128 liquidityDelta,
-        int24 slot0_tick,
-        uint160 slot0_sqrtPriceX96
-    ) internal pure returns (BalanceDelta result) {
-        // NOTE - function assumes hookFees are 0,
-        // if that changes need to add extra logic from Pool.sol function
-        if (liquidityDelta != 0) {
-            if (slot0_tick < tickLower) {
-                // current tick is below the passed range; liquidity can only become in range by crossing from left to
-                // right, when we'll need _more_ currency0 (it's becoming more valuable) so user must provide it
-                result =
-                    result +
-                    toBalanceDelta(
-                        SqrtPriceMath
-                            .getAmount0Delta(
-                                TickMath.getSqrtRatioAtTick(tickLower),
-                                TickMath.getSqrtRatioAtTick(tickUpper),
-                                liquidityDelta
-                            )
-                            .toInt128(),
-                        0
-                    );
-            } else if (slot0_tick < tickUpper) {
-                result =
-                    result +
-                    toBalanceDelta(
-                        SqrtPriceMath
-                            .getAmount0Delta(
-                                slot0_sqrtPriceX96,
-                                TickMath.getSqrtRatioAtTick(tickUpper),
-                                liquidityDelta
-                            )
-                            .toInt128(),
-                        SqrtPriceMath
-                            .getAmount1Delta(
-                                TickMath.getSqrtRatioAtTick(tickLower),
-                                slot0_sqrtPriceX96,
-                                liquidityDelta
-                            )
-                            .toInt128()
-                    );
-            } else {
-                // current tick is above the passed range; liquidity can only become in range by crossing from right to
-                // left, when we'll need _more_ currency1 (it's becoming more valuable) so user must provide it
-                result =
-                    result +
-                    toBalanceDelta(
-                        0,
-                        SqrtPriceMath
-                            .getAmount1Delta(
-                                TickMath.getSqrtRatioAtTick(tickLower),
-                                TickMath.getSqrtRatioAtTick(tickUpper),
-                                liquidityDelta
-                            )
-                            .toInt128()
-                    );
-            }
+    /// @notice If position is flat calculate profit and move it to collateral
+    function profitToCollateral(
+        PoolKey memory key,
+        address addrSwapper
+    ) internal {
+        PoolId id = key.toId();
+        require(
+            levPositions[id][addrSwapper].position0 == 0,
+            "Positions must be closed!"
+        );
+        if (levPositions[id][addrSwapper].position1 > 0) {
+            collateral[id][addrSwapper] += uint128(
+                levPositions[id][addrSwapper].position1
+            );
+        } else {
+            collateral[id][addrSwapper] += uint128(
+                -levPositions[id][addrSwapper].position1
+            );
         }
+        levPositions[id][addrSwapper].position1 = 0;
     }
 
     /// @notice Removes an LPs stake
@@ -443,125 +343,6 @@ contract PerpHook is BaseHook {
             .startLpMarginFeesPerUnit = lpMarginFeesPerUnit[id];
 
         emit Mint(msg.sender, liquidityDelta);
-    }
-
-    /// @notice Copied from uni-v3 LiquidityManagement.sol 'addLiquidity' function
-    function getLiquidityFromAmounts(
-        uint160 sqrtPriceX96,
-        int24 tickLower,
-        int24 tickUpper,
-        uint256 amount0Desired,
-        uint256 amount1Desired
-    ) internal pure returns (uint128) {
-        // compute liquidity amount given some amount0 and amount1
-        //(uint160 sqrtPriceX96, , , , , , ) = pool.slot0();
-
-        uint160 sqrtRatioAX96 = TickMath.getSqrtRatioAtTick(tickLower);
-        uint160 sqrtRatioBX96 = TickMath.getSqrtRatioAtTick(tickUpper);
-
-        uint128 liquidity = LiquidityAmounts.getLiquidityForAmounts(
-            sqrtPriceX96,
-            sqrtRatioAX96,
-            sqrtRatioBX96,
-            amount0Desired,
-            amount1Desired
-        );
-        return liquidity;
-    }
-
-    function removeLiquidity(PoolKey memory key, int128 tradeAmount) internal {
-        // Hardcoding full tick range for now
-        int24 tickLower = TickMath.minUsableTick(60);
-        int24 tickUpper = TickMath.maxUsableTick(60);
-
-        PoolId id = key.toId();
-        (uint160 slot0_sqrtPriceX96, , , ) = poolManager.getSlot0(id);
-
-        uint256 amount0Desired;
-        uint256 amount1Desired;
-        // tradeAmount is ALWAYS amount0?
-        // When we trade oneForZero will we get exact amount though?
-        amount0Desired = uint128(abs(tradeAmount));
-        amount1Desired = 2 ** 64;
-
-        // FIgure out how much we have to remove to do the swap...
-        uint256 liquidity = getLiquidityFromAmounts(
-            slot0_sqrtPriceX96,
-            tickLower,
-            tickUpper,
-            amount0Desired,
-            amount1Desired
-        );
-
-        modifyPosition(
-            key,
-            IPoolManager.ModifyPositionParams(
-                tickLower,
-                tickUpper,
-                -int256(liquidity)
-            ),
-            ""
-        );
-    }
-
-    /// @notice from https://ethereum.stackexchange.com/questions/2910/can-i-square-root-in-solidity
-    /// @notice Calculates the square root of x, rounding down.
-    /// @dev Uses the Babylonian method https://en.wikipedia.org/wiki/Methods_of_computing_square_roots#Babylonian_method.
-    /// @param x The uint256 number for which to calculate the square root.
-    /// @return result The result as an uint256.
-    function sqrt(uint256 x) internal pure returns (uint256 result) {
-        if (x == 0) {
-            return 0;
-        }
-
-        // Calculate the square root of the perfect square of a power of two that is the closest to x.
-        uint256 xAux = uint256(x);
-        result = 1;
-        if (xAux >= 0x100000000000000000000000000000000) {
-            xAux >>= 128;
-            result <<= 64;
-        }
-        if (xAux >= 0x10000000000000000) {
-            xAux >>= 64;
-            result <<= 32;
-        }
-        if (xAux >= 0x100000000) {
-            xAux >>= 32;
-            result <<= 16;
-        }
-        if (xAux >= 0x10000) {
-            xAux >>= 16;
-            result <<= 8;
-        }
-        if (xAux >= 0x100) {
-            xAux >>= 8;
-            result <<= 4;
-        }
-        if (xAux >= 0x10) {
-            xAux >>= 4;
-            result <<= 2;
-        }
-        if (xAux >= 0x8) {
-            result <<= 1;
-        }
-
-        // The operations can never overflow because the result is max 2^127 when it enters this block.
-        unchecked {
-            result = (result + x / result) >> 1;
-            result = (result + x / result) >> 1;
-            result = (result + x / result) >> 1;
-            result = (result + x / result) >> 1;
-            result = (result + x / result) >> 1;
-            result = (result + x / result) >> 1;
-            result = (result + x / result) >> 1; // Seven iterations should be enough
-            uint256 roundedDownResult = x / result;
-            return result >= roundedDownResult ? roundedDownResult : result;
-        }
-    }
-
-    /// @notice from https://ethereum.stackexchange.com/questions/84390/absolute-value-in-solidity
-    function abs(int128 x) private pure returns (uint128) {
-        return x >= 0 ? uint128(x) : uint128(-x);
     }
 
     function execMarginTrade(
@@ -722,232 +503,132 @@ contract PerpHook is BaseHook {
         return BaseHook.beforeModifyPosition.selector;
     }
 
-    /// @notice Copy/paste from PoolModifyPositionTest - we need it here because we want msg.sender to be our hook when we mint
-    function modifyPosition(
-        PoolKey memory key,
-        IPoolManager.ModifyPositionParams memory params,
-        bytes memory hookData
-    ) internal returns (BalanceDelta delta) {
-        whichLock = 1;
-        delta = abi.decode(
-            poolManager.lock(
-                abi.encode(
-                    CallbackDataModPos(msg.sender, key, params, hookData)
-                )
+    /// @notice from https://ethereum.stackexchange.com/questions/84390/absolute-value-in-solidity
+    function abs(int128 x) internal pure returns (uint128) {
+        return x >= 0 ? uint128(x) : uint128(-x);
+    }
+
+    function removeLiquidity(PoolKey memory key, int128 tradeAmount) internal {
+        // Hardcoding full tick range for now
+        int24 tickLower = TickMath.minUsableTick(60);
+        int24 tickUpper = TickMath.maxUsableTick(60);
+
+        PoolId id = key.toId();
+        (uint160 slot0_sqrtPriceX96, , , ) = poolManager.getSlot0(id);
+
+        uint256 amount0Desired;
+        uint256 amount1Desired;
+        // tradeAmount is ALWAYS amount0?
+        // When we trade oneForZero will we get exact amount though?
+        amount0Desired = uint128(abs(tradeAmount));
+        amount1Desired = 2 ** 64;
+
+        // FIgure out how much we have to remove to do the swap...
+        uint256 liquidity = getLiquidityFromAmounts(
+            slot0_sqrtPriceX96,
+            tickLower,
+            tickUpper,
+            amount0Desired,
+            amount1Desired
+        );
+
+        modifyPosition(
+            key,
+            IPoolManager.ModifyPositionParams(
+                tickLower,
+                tickUpper,
+                -int256(liquidity)
             ),
-            (BalanceDelta)
+            ""
         );
-
-        uint256 ethBalance = address(this).balance;
-        if (ethBalance > 0) {
-            CurrencyLibrary.NATIVE.transfer(msg.sender, ethBalance);
-        }
     }
 
-    /// @notice Copy/paste from PoolSwapTest - simplifies structure having it here
-    function swap(
-        PoolKey memory key,
-        IPoolManager.SwapParams memory params,
-        TestSettingsSwap memory testSettings,
-        bytes memory hookData
-    ) public payable returns (BalanceDelta delta) {
-        whichLock = 0;
-        delta = abi.decode(
-            poolManager.lock(
-                abi.encode(
-                    CallbackDataSwap(
-                        msg.sender,
-                        testSettings,
-                        key,
-                        params,
-                        hookData
-                    )
-                )
-            ),
-            (BalanceDelta)
-        );
+    /// @notice Copied from uni-v3 LiquidityManagement.sol 'addLiquidity' function
+    function getLiquidityFromAmounts(
+        uint160 sqrtPriceX96,
+        int24 tickLower,
+        int24 tickUpper,
+        uint256 amount0Desired,
+        uint256 amount1Desired
+    ) internal pure returns (uint128) {
+        // compute liquidity amount given some amount0 and amount1
+        //(uint160 sqrtPriceX96, , , , , , ) = pool.slot0();
 
-        uint256 ethBalance = address(this).balance;
-        if (ethBalance > 0)
-            CurrencyLibrary.NATIVE.transfer(msg.sender, ethBalance);
+        uint160 sqrtRatioAX96 = TickMath.getSqrtRatioAtTick(tickLower);
+        uint160 sqrtRatioBX96 = TickMath.getSqrtRatioAtTick(tickUpper);
+
+        uint128 liquidity = LiquidityAmounts.getLiquidityForAmounts(
+            sqrtPriceX96,
+            sqrtRatioAX96,
+            sqrtRatioBX96,
+            amount0Desired,
+            amount1Desired
+        );
+        return liquidity;
     }
 
-    function lockAcquired(
-        bytes calldata rawData
-    ) external override returns (bytes memory) {
-        // Should always be one of these two?
-        if (whichLock == 0) {
-            return lockAcquiredSwap(rawData);
-        } else if (whichLock == 1) {
-            return lockAcquiredModPos(rawData);
-        }
-        revert("Bad lock!");
-    }
-
-    /// @notice Copy/paste from PoolSwapTest
-    function lockAcquiredSwap(
-        bytes calldata rawData
-    ) internal returns (bytes memory) {
-        require(msg.sender == address(poolManager));
-
-        CallbackDataSwap memory data = abi.decode(rawData, (CallbackDataSwap));
-
-        BalanceDelta delta = poolManager.swap(
-            data.key,
-            data.params,
-            data.hookData
-        );
-
-        if (data.params.zeroForOne) {
-            if (delta.amount0() > 0) {
-                if (data.testSettings.settleUsingTransfer) {
-                    if (data.key.currency0.isNative()) {
-                        poolManager.settle{value: uint128(delta.amount0())}(
-                            data.key.currency0
-                        );
-                    } else {
-                        TestERC20(Currency.unwrap(data.key.currency0))
-                            .transferFrom(
-                                data.sender,
-                                address(poolManager),
-                                uint128(delta.amount0())
-                            );
-                        poolManager.settle(data.key.currency0);
-                    }
-                } else {
-                    // the received hook on this transfer will burn the tokens
-                    poolManager.safeTransferFrom(
-                        data.sender,
-                        address(poolManager),
-                        uint256(uint160(Currency.unwrap(data.key.currency0))),
-                        uint128(delta.amount0()),
-                        ""
+    /// @notice Copy/paste from 'modifyPosition' function in Pool.sol, needed so we can transfer funds from LP to stake ourselves
+    function getMintBalanceDelta(
+        int24 tickLower,
+        int24 tickUpper,
+        //int256 liquidityDelta,
+        int128 liquidityDelta,
+        int24 slot0_tick,
+        uint160 slot0_sqrtPriceX96
+    ) internal pure returns (BalanceDelta result) {
+        // NOTE - function assumes hookFees are 0,
+        // if that changes need to add extra logic from Pool.sol function
+        if (liquidityDelta != 0) {
+            if (slot0_tick < tickLower) {
+                // current tick is below the passed range; liquidity can only become in range by crossing from left to
+                // right, when we'll need _more_ currency0 (it's becoming more valuable) so user must provide it
+                result =
+                    result +
+                    toBalanceDelta(
+                        SqrtPriceMath
+                            .getAmount0Delta(
+                                TickMath.getSqrtRatioAtTick(tickLower),
+                                TickMath.getSqrtRatioAtTick(tickUpper),
+                                liquidityDelta
+                            )
+                            .toInt128(),
+                        0
                     );
-                }
-            }
-            if (delta.amount1() < 0) {
-                if (data.testSettings.withdrawTokens) {
-                    poolManager.take(
-                        data.key.currency1,
-                        data.sender,
-                        uint128(-delta.amount1())
+            } else if (slot0_tick < tickUpper) {
+                result =
+                    result +
+                    toBalanceDelta(
+                        SqrtPriceMath
+                            .getAmount0Delta(
+                                slot0_sqrtPriceX96,
+                                TickMath.getSqrtRatioAtTick(tickUpper),
+                                liquidityDelta
+                            )
+                            .toInt128(),
+                        SqrtPriceMath
+                            .getAmount1Delta(
+                                TickMath.getSqrtRatioAtTick(tickLower),
+                                slot0_sqrtPriceX96,
+                                liquidityDelta
+                            )
+                            .toInt128()
                     );
-                } else {
-                    poolManager.mint(
-                        data.key.currency1,
-                        data.sender,
-                        uint128(-delta.amount1())
-                    );
-                }
-            }
-        } else {
-            if (delta.amount1() > 0) {
-                if (data.testSettings.settleUsingTransfer) {
-                    if (data.key.currency1.isNative()) {
-                        poolManager.settle{value: uint128(delta.amount1())}(
-                            data.key.currency1
-                        );
-                    } else {
-                        TestERC20(Currency.unwrap(data.key.currency1))
-                            .transferFrom(
-                                data.sender,
-                                address(poolManager),
-                                uint128(delta.amount1())
-                            );
-                        poolManager.settle(data.key.currency1);
-                    }
-                } else {
-                    // the received hook on this transfer will burn the tokens
-                    poolManager.safeTransferFrom(
-                        data.sender,
-                        address(poolManager),
-                        uint256(uint160(Currency.unwrap(data.key.currency1))),
-                        uint128(delta.amount1()),
-                        ""
-                    );
-                }
-            }
-            if (delta.amount0() < 0) {
-                if (data.testSettings.withdrawTokens) {
-                    poolManager.take(
-                        data.key.currency0,
-                        data.sender,
-                        uint128(-delta.amount0())
-                    );
-                } else {
-                    poolManager.mint(
-                        data.key.currency0,
-                        data.sender,
-                        uint128(-delta.amount0())
-                    );
-                }
-            }
-        }
-
-        return abi.encode(delta);
-    }
-
-    /// @notice Copy/paste from PoolModifyPositionTest
-    function lockAcquiredModPos(
-        bytes calldata rawData
-    ) internal returns (bytes memory) {
-        require(msg.sender == address(poolManager));
-
-        CallbackDataModPos memory data = abi.decode(
-            rawData,
-            (CallbackDataModPos)
-        );
-
-        BalanceDelta delta = poolManager.modifyPosition(
-            data.key,
-            data.params,
-            data.hookData
-        );
-
-        if (delta.amount0() > 0) {
-            if (data.key.currency0.isNative()) {
-                poolManager.settle{value: uint128(delta.amount0())}(
-                    data.key.currency0
-                );
             } else {
-                TestERC20(Currency.unwrap(data.key.currency0)).transferFrom(
-                    data.sender,
-                    address(poolManager),
-                    uint128(delta.amount0())
-                );
-                poolManager.settle(data.key.currency0);
+                // current tick is above the passed range; liquidity can only become in range by crossing from right to
+                // left, when we'll need _more_ currency1 (it's becoming more valuable) so user must provide it
+                result =
+                    result +
+                    toBalanceDelta(
+                        0,
+                        SqrtPriceMath
+                            .getAmount1Delta(
+                                TickMath.getSqrtRatioAtTick(tickLower),
+                                TickMath.getSqrtRatioAtTick(tickUpper),
+                                liquidityDelta
+                            )
+                            .toInt128()
+                    );
             }
         }
-        if (delta.amount1() > 0) {
-            if (data.key.currency1.isNative()) {
-                poolManager.settle{value: uint128(delta.amount1())}(
-                    data.key.currency1
-                );
-            } else {
-                TestERC20(Currency.unwrap(data.key.currency1)).transferFrom(
-                    data.sender,
-                    address(poolManager),
-                    uint128(delta.amount1())
-                );
-                poolManager.settle(data.key.currency1);
-            }
-        }
-
-        if (delta.amount0() < 0) {
-            poolManager.take(
-                data.key.currency0,
-                data.sender,
-                uint128(-delta.amount0())
-            );
-        }
-        if (delta.amount1() < 0) {
-            poolManager.take(
-                data.key.currency1,
-                data.sender,
-                uint128(-delta.amount1())
-            );
-        }
-
-        return abi.encode(delta);
     }
 }

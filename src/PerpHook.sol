@@ -19,7 +19,7 @@ contract PerpHook is PoolCallsHook {
     using CurrencyLibrary for Currency;
 
     // By keeping track of result of swaps executed on behalf of user we can track profits
-    struct LeveragedPosition {
+    struct SwapperPosition {
         int128 position0;
         int128 position1;
         uint256 startSwapMarginFeesPerUnit;
@@ -43,8 +43,7 @@ contract PerpHook is PoolCallsHook {
     mapping(PoolId => mapping(address => uint256)) public collateral;
     // Profits from margin fees paid to LPs - will represent amount in USDC
     mapping(PoolId => mapping(address => uint256)) public lpProfits;
-    mapping(PoolId => mapping(address => LeveragedPosition))
-        public levPositions;
+    mapping(PoolId => mapping(address => SwapperPosition)) public levPositions;
 
     mapping(PoolId => mapping(address => LPPosition)) public lpPositions;
 
@@ -122,22 +121,36 @@ contract PerpHook is PoolCallsHook {
 
         // We can just execute the swap and confirm that it was a valid liquidation
         // based on amounts post-swap, and revert if it's invalid
-        int128 tradeAmount = -levPositions[id][liqSwapper].position0;
-        BalanceDelta delta = execMarginTrade(key, tradeAmount);
-        // This is the current position value
-        int128 positionVal = delta.amount1();
+
+        bool zeroIsUSDC = Currency.unwrap(key.currency0) == colTokenAddr;
+        int128 tradeAmount;
+        if (zeroIsUSDC) {
+            tradeAmount = -levPositions[id][liqSwapper].position1;
+        } else {
+            tradeAmount = -levPositions[id][liqSwapper].position0;
+        }
+        BalanceDelta delta = execMarginTrade(key, tradeAmount, zeroIsUSDC);
 
         settleSwapper(id, liqSwapper);
-
         uint256 swapperCol = collateral[id][liqSwapper];
-        LeveragedPosition memory swapperPos = levPositions[id][liqSwapper];
-        int128 profit = positionVal - swapperPos.position1;
+        SwapperPosition memory swapperPos = levPositions[id][liqSwapper];
+
+        // This will be the current position value
+        int128 positionVal;
+        int128 profitUSDC;
+        if (zeroIsUSDC) {
+            positionVal = delta.amount0();
+            profitUSDC = positionVal - swapperPos.position0;
+        } else {
+            positionVal = delta.amount1();
+            profitUSDC = positionVal - swapperPos.position1;
+        }
 
         uint remainingCollateral;
-        if (profit < 0) {
-            remainingCollateral = swapperCol - uint128(-profit);
+        if (profitUSDC < 0) {
+            remainingCollateral = swapperCol - uint128(-profitUSDC);
         } else {
-            remainingCollateral = swapperCol + uint128(profit);
+            remainingCollateral = swapperCol + uint128(profitUSDC);
         }
 
         // Must be greater than 20x leverage in order to liquidate!
@@ -160,7 +173,7 @@ contract PerpHook is PoolCallsHook {
             .startSwapFundingFeesPerUnit = swapFundingFeesPerUnit[id];
 
         // This should take care of calculating current swapper collateral
-        profitToCollateral(key, liqSwapper);
+        swapperProfitToCollateral(key, liqSwapper);
 
         emit Liquidate(msg.sender, liqSwapper, tradeAmount);
     }
@@ -201,25 +214,44 @@ contract PerpHook is PoolCallsHook {
     }
 
     /// @notice If position is flat calculate profit and move it to collateral
-    function profitToCollateral(
+    function swapperProfitToCollateral(
         PoolKey memory key,
         address addrSwapper
     ) internal {
         PoolId id = key.toId();
-        require(
-            levPositions[id][addrSwapper].position0 == 0,
-            "Positions must be closed!"
-        );
-        if (levPositions[id][addrSwapper].position1 > 0) {
-            collateral[id][addrSwapper] += uint128(
-                levPositions[id][addrSwapper].position1
+
+        bool zeroIsUSDC = Currency.unwrap(key.currency0) == colTokenAddr;
+        if (zeroIsUSDC) {
+            require(
+                levPositions[id][addrSwapper].position1 == 0,
+                "Positions must be closed!"
             );
+            if (levPositions[id][addrSwapper].position0 > 0) {
+                collateral[id][addrSwapper] += uint128(
+                    levPositions[id][addrSwapper].position0
+                );
+            } else {
+                collateral[id][addrSwapper] += uint128(
+                    -levPositions[id][addrSwapper].position0
+                );
+            }
+            levPositions[id][addrSwapper].position0 = 0;
         } else {
-            collateral[id][addrSwapper] += uint128(
-                -levPositions[id][addrSwapper].position1
+            require(
+                levPositions[id][addrSwapper].position0 == 0,
+                "Positions must be closed!"
             );
+            if (levPositions[id][addrSwapper].position1 > 0) {
+                collateral[id][addrSwapper] += uint128(
+                    levPositions[id][addrSwapper].position1
+                );
+            } else {
+                collateral[id][addrSwapper] += uint128(
+                    -levPositions[id][addrSwapper].position1
+                );
+            }
+            levPositions[id][addrSwapper].position1 = 0;
         }
-        levPositions[id][addrSwapper].position1 = 0;
     }
 
     /// @notice Removes an LPs stake
@@ -254,14 +286,20 @@ contract PerpHook is PoolCallsHook {
 
         TestERC20 token0 = TestERC20(Currency.unwrap(key.currency0));
         TestERC20 token1 = TestERC20(Currency.unwrap(key.currency1));
-        // Return tokens to sender...
-        token0.transfer(msg.sender, uint128(delta.amount0()));
 
-        // Include margin fees in this transfer
-        token1.transfer(
-            msg.sender,
-            uint128(delta.amount1()) + lpProfits[id][msg.sender]
-        );
+        uint128 send0 = uint128(delta.amount0());
+        uint128 send1 = uint128(delta.amount1());
+
+        // Include profits from whichever one was USDC
+        if (address(token0) == colTokenAddr) {
+            send0 += uint128(lpProfits[id][msg.sender]);
+        } else {
+            send1 += uint128(lpProfits[id][msg.sender]);
+        }
+
+        token0.transfer(msg.sender, send0);
+        token1.transfer(msg.sender, send1);
+
         lpProfits[id][msg.sender] = 0;
 
         emit Burn(msg.sender, liquidityDelta);
@@ -303,7 +341,8 @@ contract PerpHook is PoolCallsHook {
         TestERC20 token1 = TestERC20(Currency.unwrap(key.currency1));
 
         // Because we're minting these values will always be positive, so uint128 cast is safe
-        // TODO - better understand what is going on here - if we comment out the token1 transfer it still works!?
+        // TODO - better understand what is going on here
+        // if we comment out the token1 transfer it still works!?
         token0.transferFrom(
             msg.sender,
             address(this),
@@ -339,20 +378,26 @@ contract PerpHook is PoolCallsHook {
 
     function execMarginTrade(
         PoolKey memory key,
-        int128 tradeAmount
+        int128 tradeAmount,
+        bool zeroIsUSDC
     ) internal returns (BalanceDelta delta) {
         removeLiquidity(key, tradeAmount);
 
         /*
-        We're expressing tradeAmount as the trade size in token0, where a positive
-        number represents a long position, while a negative number represents a
-        short position, but when actually executing we have to use (-tradeAmount),
-        since for the pool logic if we have:
+        We're expressing tradeAmount as the trade size in the non-USDC token, 
+        where a positive number represents a long position, while a negative number 
+        represents a short position, but when actually executing we have to use 
+        (-tradeAmount), since for the pool logic if we have:
         zeroForOne = true
         tradeAmount = 100 (or any positive number)
         it means we'll swap 100 token0s for token1s, so this is actually SELLING token0
         */
-        bool zeroForOne = tradeAmount > 0 ? false : true;
+        bool zeroForOne;
+        if (zeroIsUSDC) {
+            zeroForOne = tradeAmount > 0 ? true : false;
+        } else {
+            zeroForOne = tradeAmount > 0 ? false : true;
+        }
         IPoolManager.SwapParams memory params = IPoolManager.SwapParams({
             zeroForOne: zeroForOne,
             amountSpecified: -tradeAmount,
@@ -361,7 +406,7 @@ contract PerpHook is PoolCallsHook {
                 : TickMath.MAX_SQRT_RATIO - 1 // unlimited impact
         });
 
-        TestSettingsSwap memory testSettings = TestSettingsSwap({
+        SettingsSwap memory testSettings = SettingsSwap({
             withdrawTokens: true,
             settleUsingTransfer: true
         });
@@ -374,25 +419,11 @@ contract PerpHook is PoolCallsHook {
         PoolKey memory key,
         int128 tradeAmount
     ) external payable {
-        BalanceDelta delta = execMarginTrade(key, tradeAmount);
+        bool zeroIsUSDC = Currency.unwrap(key.currency0) == colTokenAddr;
+        BalanceDelta delta = execMarginTrade(key, tradeAmount, zeroIsUSDC);
 
         PoolId id = key.toId();
         settleSwapper(id, msg.sender);
-
-        // token1 amount is our trade size
-        // Assumes token1 will always be USDC - in reality we cannot make this
-        // assumption, even if all pairs have USDC it could be token0 or token1
-        uint128 amountUSDC = abs(delta.amount1());
-
-        // Remember - collateral is also in USDC
-        // Saying max 20x leverage - we'll liquidate at that point
-        uint collateral20x = collateral[id][msg.sender] * 20;
-
-        // Should we multiply by 10^x to get better precision?
-        uint ratio = collateral20x / amountUSDC;
-        // Saying 10x initial leverage requirement
-        // require(amountUSDC <= collateral20x / 2);
-        require(ratio >= 2, "Not enough collateral");
 
         // (uint160 slot0_sqrtPriceX96, , , ) = poolManager.getSlot0(id);
 
@@ -411,14 +442,25 @@ contract PerpHook is PoolCallsHook {
         levPositions[id][msg.sender].position0 += delta.amount0();
         levPositions[id][msg.sender].position1 += delta.amount1();
 
+        // TODO - need to do collateral check HERE, based on current position value
+        uint128 amountUSDC = abs(delta.amount1());
+        uint collateral20x = collateral[id][msg.sender] * 20;
+        uint ratio = collateral20x / amountUSDC;
+        require(ratio >= 2, "Not enough collateral");
+
         levPositions[id][msg.sender]
             .startSwapMarginFeesPerUnit = swapMarginFeesPerUnit[id];
         levPositions[id][msg.sender]
             .startSwapFundingFeesPerUnit = swapFundingFeesPerUnit[id];
 
         // If they've closed their position, calculate their profit and add to collateral
-        if (levPositions[id][msg.sender].position0 == 0) {
-            profitToCollateral(key, msg.sender);
+
+        bool cond1 = (zeroIsUSDC &&
+            (levPositions[id][msg.sender].position1 == 0));
+        bool cond2 = (!zeroIsUSDC &&
+            (levPositions[id][msg.sender].position0 == 0));
+        if (cond1 || cond2) {
+            swapperProfitToCollateral(key, msg.sender);
         }
 
         emit Trade(msg.sender, tradeAmount);
@@ -465,6 +507,11 @@ contract PerpHook is PoolCallsHook {
         bytes calldata
     ) external override returns (bytes4) {
         PoolId id = key.toId();
+        require(
+            Currency.unwrap(key.currency0) == colTokenAddr ||
+                Currency.unwrap(key.currency1) == colTokenAddr,
+            "Must have USDC pair!"
+        );
         // Round down to nearest hour
         lastFundingTime[id] = (block.timestamp / (3600)) * 3600;
         return BaseHook.beforeInitialize.selector;

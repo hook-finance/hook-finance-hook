@@ -223,7 +223,7 @@ contract PerpHookTest is Test, Deployers, GasSnapshot {
         // console2.log("OUR LIQ 1", position.liquidity);
     }
 
-    function testMarginTrade() public {
+    function testMarginTrade1() public {
         token0.approve(address(perpHook), 100 ether);
         token1.approve(address(perpHook), 100 ether);
 
@@ -244,7 +244,7 @@ contract PerpHookTest is Test, Deployers, GasSnapshot {
 
         int128 tradeAmount = 1 ether;
 
-        (uint160 sqrtPriceX96_before, , , ) = manager.getSlot0(poolId1);
+        (uint160 sqrtPriceX96_before1, , , ) = manager.getSlot0(poolId1);
         // console2.log("PRICE BEFORE", sqrtPriceX96);
 
         // With no collateral should fail!
@@ -255,8 +255,34 @@ contract PerpHookTest is Test, Deployers, GasSnapshot {
         perpHook.depositCollateral(poolKey1, depositAmount);
         perpHook.marginTrade(poolKey1, tradeAmount);
 
-        (uint160 sqrtPriceX96_after, , , ) = manager.getSlot0(poolId1);
+        (uint160 sqrtPriceX96_after1, , , ) = manager.getSlot0(poolId1);
         // console2.log("PRICE AFTER", sqrtPriceX962);
-        assertGt(sqrtPriceX96_after, sqrtPriceX96_before);
+        assertGt(sqrtPriceX96_after1, sqrtPriceX96_before1);
+    }
+
+    function testZMarginTrade0() public {
+        // test with USDC as token0
+        token1.approve(address(perpHook), 100 ether);
+        token2.approve(address(perpHook), 100 ether);
+
+        // Need to mint so we have funds to pull
+        // Should add a test to make sure fails gracefully if no free liquidity?
+        perpHook.lpMint(poolKey0, 3 ether);
+        int128 tradeAmount = 1 ether;
+
+        (uint160 sqrtPriceX96_before0, , , ) = manager.getSlot0(poolId0);
+
+        // With no collateral should fail!
+        vm.expectRevert();
+        perpHook.marginTrade(poolKey0, tradeAmount);
+
+        uint depositAmount = 5 ether;
+
+        perpHook.depositCollateral(poolKey0, depositAmount);
+        perpHook.marginTrade(poolKey0, tradeAmount);
+
+        (uint160 sqrtPriceX96_after0, , , ) = manager.getSlot0(poolId0);
+        // console2.log("PRICE AFTER", sqrtPriceX962);
+        assertLt(sqrtPriceX96_after0, sqrtPriceX96_before0);
     }
 }

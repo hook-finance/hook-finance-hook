@@ -23,13 +23,13 @@ contract PoolCallsHook is BaseHook {
 
     struct CallbackDataSwap {
         address sender;
-        TestSettingsSwap testSettings;
+        SettingsSwap testSettings;
         PoolKey key;
         IPoolManager.SwapParams params;
         bytes hookData;
     }
 
-    struct TestSettingsSwap {
+    struct SettingsSwap {
         bool withdrawTokens;
         bool settleUsingTransfer;
     }
@@ -78,7 +78,7 @@ contract PoolCallsHook is BaseHook {
     function swap(
         PoolKey memory key,
         IPoolManager.SwapParams memory params,
-        TestSettingsSwap memory testSettings,
+        SettingsSwap memory testSettings,
         bytes memory hookData
     ) public payable returns (BalanceDelta delta) {
         whichLock = 0;

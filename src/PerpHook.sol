@@ -507,11 +507,18 @@ contract PerpHook is PoolCallsHook {
         bytes calldata
     ) external override returns (bytes4) {
         PoolId id = key.toId();
+        address token0 = Currency.unwrap(key.currency0);
+        address token1 = Currency.unwrap(key.currency1);
         require(
-            Currency.unwrap(key.currency0) == colTokenAddr ||
-                Currency.unwrap(key.currency1) == colTokenAddr,
+            token0 == colTokenAddr || token1 == colTokenAddr,
             "Must have USDC pair!"
         );
+        // Transfer logic is hardcoded for erc20s so disable ETH for now
+        require(
+            token0 != address(0) && token1 != address(0),
+            "Cannot have ETH pair!"
+        );
+
         // Round down to nearest hour
         lastFundingTime[id] = (block.timestamp / (3600)) * 3600;
         return BaseHook.beforeInitialize.selector;

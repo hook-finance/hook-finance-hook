@@ -444,21 +444,12 @@ contract PerpHook is PoolCallsHook {
         levPositions[id][msg.sender].position0 += delta.amount0();
         levPositions[id][msg.sender].position1 += delta.amount1();
 
-        // TODO - need to do collateral check HERE, based on current position value
-
-        /*
-        Use sqrtPriceX96 as price for our collateral check
-        We want price*position to get value of poisition in USDC
-        price = (sqrtPriceX96 / 2**96)**2
-
-        If USDC is token0 formula is:
-        ((math.sqrt(amount) * 2**96) / sqrtPriceInv) ** 2
-        If USDC is token1 formula is:
-        ((sqrtPriceX96 * math.sqrt(amount)) / 2**96) ** 2
-        */
-
-        uint256 amountUSDC;
         (uint160 sqrtPriceX96, , , ) = poolManager.getSlot0(id);
+        uint256 baseAmount = zeroIsUSDC
+            ? abs(levPositions[id][msg.sender].position1)
+            : abs(levPositions[id][msg.sender].position0);
+        uint256 amountUSDC = getUSDCValue(zeroIsUSDC, sqrtPriceX96, baseAmount);
+
         if (zeroIsUSDC) {
             uint256 sqrtAmount = sqrt(
                 abs(levPositions[id][msg.sender].position1)
@@ -480,6 +471,7 @@ contract PerpHook is PoolCallsHook {
             );
             amountUSDC = amountUSDC * amountUSDC;
         }
+        // Saying 10x initial margin
         uint collateral10x = collateral[id][msg.sender] * 10;
         require(collateral10x >= amountUSDC, "Not enough collateral");
 
@@ -507,20 +499,68 @@ contract PerpHook is PoolCallsHook {
         emit Trade(msg.sender, tradeAmount);
     }
 
+    /// @notice Converts base amount to USDC amount, using pool sqrtPriceX96 as the price
+    function getUSDCValue(
+        bool zeroIsUSDC,
+        uint160 sqrtPriceX96,
+        uint256 baseAmount
+    ) private pure returns (uint256 amountUSDC) {
+        /*
+        Use sqrtPriceX96 as price for conversions in a couple spots
+        We want price*position to get value of position in USDC
+        price = (sqrtPriceX96 / 2**96)**2
+
+        If USDC is token0 formula is:
+        ((math.sqrt(amount) * 2**96) / sqrtPrice) ** 2
+        If USDC is token1 formula is:
+        ((sqrtPriceX96 * math.sqrt(amount)) / 2**96) ** 2
+
+        Think overflow shouldn't be a concern since we use sqrtAmount?
+        */
+
+        uint256 sqrtAmount = sqrt(baseAmount);
+        if (zeroIsUSDC) {
+            // baseAmount should be
+            // abs(levPositions[id][msg.sender].position1)
+            amountUSDC = FullMath.mulDiv(
+                sqrtAmount,
+                FixedPoint96.Q96,
+                sqrtPriceX96
+            );
+        } else {
+            // baseAmount should be
+            // abs(levPositions[id][msg.sender].position0)
+            amountUSDC = FullMath.mulDiv(
+                sqrtPriceX96,
+                sqrtAmount,
+                FixedPoint96.Q96
+            );
+        }
+        amountUSDC = amountUSDC * amountUSDC;
+    }
+
     function doFundingMarginPayments(PoolKey memory key) private {
+        // TODO - wasteful to calculate this on every swap, should we check that
+        // we need to make a payment first?
         PoolId id = key.toId();
+        (uint160 sqrtPriceX96, , , ) = poolManager.getSlot0(id);
+        bool zeroIsUSDC = Currency.unwrap(key.currency0) == colTokenAddr;
+        // total amount of position values
+        uint256 amountUSDC = getUSDCValue(
+            zeroIsUSDC,
+            sqrtPriceX96,
+            marginSwapsAbs[id]
+        );
+        /*
+        margin fee:
+        10% annual on position size, charged hourly
+        365*24 = 8760 periods
+        So divide by 87600 every hour to get payment
+        1*10**18 / 87600 * 8760 = 1*10**17
+        */
+        uint marginPayment = amountUSDC / 87600;
 
         while (block.timestamp > lastFundingTime[id] + 3600) {
-            /*
-            margin fee:
-            10% annual on position size, charged hourly
-            365*24 = 8760 periods
-            So divide by 87600 every hour to get payment
-            1*10**18 / 87600 * 8760 = 1*10**17
-            */
-
-            // TODO - need to convert amount to USDC...
-            uint marginPayment = marginSwapsAbs[id] / 87600;
             if (marginPayment > 0) {
                 lpMarginFeesPerUnit[id] += marginPayment / lpLiqTotal[id];
                 swapMarginFeesPerUnit[id] += marginPayment / marginSwapsAbs[id];

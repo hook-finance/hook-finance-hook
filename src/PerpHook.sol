@@ -540,9 +540,14 @@ contract PerpHook is PoolCallsHook {
     }
 
     function doFundingMarginPayments(PoolKey memory key) private {
-        // TODO - wasteful to calculate this on every swap, should we check that
-        // we need to make a payment first?
         PoolId id = key.toId();
+        uint256 num_funding_periods = (block.timestamp - lastFundingTime[id]) /
+            3600;
+        if (num_funding_periods == 0) {
+            return;
+        }
+        lastFundingTime[id] += (num_funding_periods * 3600);
+
         (uint160 sqrtPriceX96, , , ) = poolManager.getSlot0(id);
         bool zeroIsUSDC = Currency.unwrap(key.currency0) == colTokenAddr;
         // total amount of position values
@@ -585,14 +590,11 @@ contract PerpHook is PoolCallsHook {
         }
         int256 swapFundingAdj = fundingPayment / marginSwapsNet[id];
 
-        // TODO - could remove loop and replace with calculations of adjustments
-        while (block.timestamp > lastFundingTime[id] + 3600) {
-            lpMarginFeesPerUnit[id] += lpMarginAdj;
-            swapMarginFeesPerUnit[id] += swapMarginAdj;
-            swapFundingFeesPerUnit[id] += swapFundingAdj;
-
-            lastFundingTime[id] += 3600;
-        }
+        lpMarginFeesPerUnit[id] += lpMarginAdj * num_funding_periods;
+        swapMarginFeesPerUnit[id] += swapMarginAdj * num_funding_periods;
+        swapFundingFeesPerUnit[id] +=
+            swapFundingAdj *
+            int256(num_funding_periods);
     }
 
     // -----------------------------------------------

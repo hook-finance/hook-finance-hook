@@ -7,7 +7,10 @@ import {PoolKey} from "@uniswap/v4-core/contracts/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/contracts/types/PoolId.sol";
 import {BalanceDelta} from "@uniswap/v4-core/contracts/types/BalanceDelta.sol";
 import {TickMath} from "@uniswap/v4-core/contracts/libraries/TickMath.sol";
+import {FullMath} from "@uniswap/v4-core/contracts/libraries/FullMath.sol";
+import {FixedPoint96} from "@uniswap/v4-core/contracts/libraries/FixedPoint96.sol";
 import {TestERC20} from "@uniswap/v4-core/contracts/test/TestERC20.sol";
+
 import {CurrencyLibrary, Currency} from "@uniswap/v4-core/contracts/types/Currency.sol";
 import {PoolCallsHook} from "./PoolCallsHook.sol";
 import {UniHelpers} from "./UniHelpers.sol";
@@ -442,10 +445,43 @@ contract PerpHook is PoolCallsHook {
         levPositions[id][msg.sender].position1 += delta.amount1();
 
         // TODO - need to do collateral check HERE, based on current position value
-        uint128 amountUSDC = abs(delta.amount1());
-        uint collateral20x = collateral[id][msg.sender] * 20;
-        uint ratio = collateral20x / amountUSDC;
-        require(ratio >= 2, "Not enough collateral");
+
+        /*
+        Use sqrtPriceX96 as price for our collateral check
+        We want price*position to get value of poisition in USDC
+        price = (sqrtPriceX96 / 2**96)**2
+
+        If USDC is token0 formula is:
+        ((math.sqrt(amount) * 2**96) / sqrtPriceInv) ** 2
+        If USDC is token1 formula is:
+        ((sqrtPriceX96 * math.sqrt(amount)) / 2**96) ** 2
+        */
+
+        uint256 amountUSDC;
+        (uint160 sqrtPriceX96, , , ) = poolManager.getSlot0(id);
+        if (zeroIsUSDC) {
+            uint256 sqrtAmount = sqrt(
+                abs(levPositions[id][msg.sender].position1)
+            );
+            amountUSDC = FullMath.mulDiv(
+                sqrtAmount,
+                FixedPoint96.Q96,
+                sqrtPriceX96
+            );
+            amountUSDC = amountUSDC * amountUSDC;
+        } else {
+            uint256 sqrtAmount = sqrt(
+                abs(levPositions[id][msg.sender].position0)
+            );
+            amountUSDC = FullMath.mulDiv(
+                sqrtPriceX96,
+                sqrtAmount,
+                FixedPoint96.Q96
+            );
+            amountUSDC = amountUSDC * amountUSDC;
+        }
+        uint collateral10x = collateral[id][msg.sender] * 10;
+        require(collateral10x >= amountUSDC, "Not enough collateral");
 
         levPositions[id][msg.sender]
             .startSwapMarginFeesPerUnit = swapMarginFeesPerUnit[id];
@@ -559,6 +595,61 @@ contract PerpHook is PoolCallsHook {
     /// @notice from https://ethereum.stackexchange.com/questions/84390/absolute-value-in-solidity
     function abs(int128 x) private pure returns (uint128) {
         return x >= 0 ? uint128(x) : uint128(-x);
+    }
+
+    /// @notice from https://ethereum.stackexchange.com/questions/2910/can-i-square-root-in-solidity
+    /// @notice Calculates the square root of x, rounding down.
+    /// @dev Uses the Babylonian method https://en.wikipedia.org/wiki/Methods_of_computing_square_roots#Babylonian_method.
+    /// @param x The uint256 number for which to calculate the square root.
+    /// @return result The result as an uint256.
+    function sqrt(uint256 x) internal pure returns (uint256 result) {
+        if (x == 0) {
+            return 0;
+        }
+
+        // Calculate the square root of the perfect square of a power of two that is the closest to x.
+        uint256 xAux = uint256(x);
+        result = 1;
+        if (xAux >= 0x100000000000000000000000000000000) {
+            xAux >>= 128;
+            result <<= 64;
+        }
+        if (xAux >= 0x10000000000000000) {
+            xAux >>= 64;
+            result <<= 32;
+        }
+        if (xAux >= 0x100000000) {
+            xAux >>= 32;
+            result <<= 16;
+        }
+        if (xAux >= 0x10000) {
+            xAux >>= 16;
+            result <<= 8;
+        }
+        if (xAux >= 0x100) {
+            xAux >>= 8;
+            result <<= 4;
+        }
+        if (xAux >= 0x10) {
+            xAux >>= 4;
+            result <<= 2;
+        }
+        if (xAux >= 0x8) {
+            result <<= 1;
+        }
+
+        // The operations can never overflow because the result is max 2^127 when it enters this block.
+        unchecked {
+            result = (result + x / result) >> 1;
+            result = (result + x / result) >> 1;
+            result = (result + x / result) >> 1;
+            result = (result + x / result) >> 1;
+            result = (result + x / result) >> 1;
+            result = (result + x / result) >> 1;
+            result = (result + x / result) >> 1; // Seven iterations should be enough
+            uint256 roundedDownResult = x / result;
+            return result >= roundedDownResult ? roundedDownResult : result;
+        }
     }
 
     function removeLiquidity(PoolKey memory key, int128 tradeAmount) private {

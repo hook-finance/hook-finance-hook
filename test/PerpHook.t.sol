@@ -165,6 +165,9 @@ contract PerpHookTest is Test, Deployers, GasSnapshot {
         // Need to mint before we can do a trade
         perpHook.lpMint(poolKey1, 10 ether);
         perpHook.marginTrade(poolKey1, -2 ether);
+        // Check that margin amounts are valid
+        assertEq(perpHook.marginSwapsAbs(poolId1), 2 ether);
+        assertEq(perpHook.marginSwapsNet(poolId1), -2 ether);
 
         // open position so this should fail
         vm.expectRevert();
@@ -173,6 +176,10 @@ contract PerpHookTest is Test, Deployers, GasSnapshot {
         // And how after closing trade we should be able to withdraw
         perpHook.marginTrade(poolKey1, 2 ether);
         perpHook.withdrawCollateral(poolKey1, depositAmount);
+
+        // And margin amounts should be at 0
+        assertEq(perpHook.marginSwapsAbs(poolId1), 0);
+        assertEq(perpHook.marginSwapsNet(poolId1), 0);
     }
 
     function testLpMint() public {
@@ -201,7 +208,6 @@ contract PerpHookTest is Test, Deployers, GasSnapshot {
         );
         // Should start with 0...
         assertEq(position0.liquidity, 0);
-        // console2.log("OUR LIQ 0", position0.liquidity);
 
         perpHook.lpMint(poolKey1, 3 ether);
 
@@ -255,12 +261,15 @@ contract PerpHookTest is Test, Deployers, GasSnapshot {
         perpHook.depositCollateral(poolKey1, depositAmount);
         perpHook.marginTrade(poolKey1, tradeAmount);
 
+        assertEq(perpHook.marginSwapsAbs(poolId1), 1 ether);
+        assertEq(perpHook.marginSwapsNet(poolId1), 1 ether);
+
         (uint160 sqrtPriceX96_after1, , , ) = manager.getSlot0(poolId1);
         // console2.log("PRICE AFTER", sqrtPriceX962);
-        assertGt(sqrtPriceX96_after1, sqrtPriceX96_before1);
+        assertLt(sqrtPriceX96_after1, sqrtPriceX96_before1);
     }
 
-    function testZMarginTrade0() public {
+    function testMarginTrade0() public {
         // test with USDC as token0
         token1.approve(address(perpHook), 100 ether);
         token2.approve(address(perpHook), 100 ether);
@@ -281,8 +290,11 @@ contract PerpHookTest is Test, Deployers, GasSnapshot {
         perpHook.depositCollateral(poolKey0, depositAmount);
         perpHook.marginTrade(poolKey0, tradeAmount);
 
+        assertEq(perpHook.marginSwapsAbs(poolId0), 1 ether);
+        assertEq(perpHook.marginSwapsNet(poolId0), 1 ether);
+
         (uint160 sqrtPriceX96_after0, , , ) = manager.getSlot0(poolId0);
         // console2.log("PRICE AFTER", sqrtPriceX962);
-        assertLt(sqrtPriceX96_after0, sqrtPriceX96_before0);
+        assertGt(sqrtPriceX96_after0, sqrtPriceX96_before0);
     }
 }

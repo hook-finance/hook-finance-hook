@@ -64,7 +64,7 @@ contract PerpHook is PoolCallsHook {
     mapping(PoolId => int256) public swapFundingFeesPerUnit;
 
     // Only accepting one token as collateral for now, set to USDC by default
-    address colTokenAddr;
+    address public colTokenAddr;
 
     event Mint(address indexed minter, int256 amount);
     event Burn(address indexed burner, int256 amount);
@@ -86,7 +86,7 @@ contract PerpHook is PoolCallsHook {
     }
 
     /// @notice manage margin and funding payments for swappers
-    function settleSwapper(PoolId id, address addrSwapper) internal {
+    function settleSwapper(PoolId id, address addrSwapper) private {
         uint256 marginFeesPerUnit = swapMarginFeesPerUnit[id] -
             levPositions[id][addrSwapper].startSwapMarginFeesPerUnit;
         uint256 marginPaid = marginFeesPerUnit *
@@ -106,7 +106,7 @@ contract PerpHook is PoolCallsHook {
     }
 
     /// @notice manage margin payments to LPs
-    function settleLP(PoolId id, address addrLP) internal {
+    function settleLP(PoolId id, address addrLP) private {
         // Need to add all their margin fees to profits
         // so move current fees to profits...
         uint marginFeesPerUnit = lpMarginFeesPerUnit[id] -
@@ -126,9 +126,12 @@ contract PerpHook is PoolCallsHook {
         int128 tradeAmount;
         if (zeroIsUSDC) {
             tradeAmount = -levPositions[id][liqSwapper].position1;
+            decreaseMarginAmounts(id, levPositions[id][liqSwapper].position1);
         } else {
             tradeAmount = -levPositions[id][liqSwapper].position0;
+            decreaseMarginAmounts(id, levPositions[id][liqSwapper].position0);
         }
+
         BalanceDelta delta = execMarginTrade(key, tradeAmount, zeroIsUSDC);
 
         settleSwapper(id, liqSwapper);
@@ -175,6 +178,8 @@ contract PerpHook is PoolCallsHook {
         // This should take care of calculating current swapper collateral
         swapperProfitToCollateral(key, liqSwapper);
 
+        // Don't need to call increaseMarginAmounts because position must be 0!
+
         emit Liquidate(msg.sender, liqSwapper, tradeAmount);
     }
 
@@ -217,7 +222,7 @@ contract PerpHook is PoolCallsHook {
     function swapperProfitToCollateral(
         PoolKey memory key,
         address addrSwapper
-    ) internal {
+    ) private {
         PoolId id = key.toId();
 
         bool zeroIsUSDC = Currency.unwrap(key.currency0) == colTokenAddr;
@@ -340,9 +345,7 @@ contract PerpHook is PoolCallsHook {
         TestERC20 token0 = TestERC20(Currency.unwrap(key.currency0));
         TestERC20 token1 = TestERC20(Currency.unwrap(key.currency1));
 
-        // Because we're minting these values will always be positive, so uint128 cast is safe
-        // TODO - better understand what is going on here
-        // if we comment out the token1 transfer it still works!?
+        // Because we're minting values will always be positive, so uint128 cast is safe
         token0.transferFrom(
             msg.sender,
             address(this),
@@ -380,27 +383,18 @@ contract PerpHook is PoolCallsHook {
         PoolKey memory key,
         int128 tradeAmount,
         bool zeroIsUSDC
-    ) internal returns (BalanceDelta delta) {
+    ) private returns (BalanceDelta delta) {
         removeLiquidity(key, tradeAmount);
 
-        /*
-        We're expressing tradeAmount as the trade size in the non-USDC token, 
-        where a positive number represents a long position, while a negative number 
-        represents a short position, but when actually executing we have to use 
-        (-tradeAmount), since for the pool logic if we have:
-        zeroForOne = true
-        tradeAmount = 100 (or any positive number)
-        it means we'll swap 100 token0s for token1s, so this is actually SELLING token0
-        */
         bool zeroForOne;
         if (zeroIsUSDC) {
-            zeroForOne = tradeAmount > 0 ? true : false;
-        } else {
             zeroForOne = tradeAmount > 0 ? false : true;
+        } else {
+            zeroForOne = tradeAmount > 0 ? true : false;
         }
         IPoolManager.SwapParams memory params = IPoolManager.SwapParams({
             zeroForOne: zeroForOne,
-            amountSpecified: -tradeAmount,
+            amountSpecified: tradeAmount,
             sqrtPriceLimitX96: zeroForOne
                 ? TickMath.MIN_SQRT_RATIO + 1
                 : TickMath.MAX_SQRT_RATIO - 1 // unlimited impact
@@ -420,9 +414,14 @@ contract PerpHook is PoolCallsHook {
         int128 tradeAmount
     ) external payable {
         bool zeroIsUSDC = Currency.unwrap(key.currency0) == colTokenAddr;
+        PoolId id = key.toId();
+        if (zeroIsUSDC) {
+            decreaseMarginAmounts(id, levPositions[id][msg.sender].position1);
+        } else {
+            decreaseMarginAmounts(id, levPositions[id][msg.sender].position0);
+        }
         BalanceDelta delta = execMarginTrade(key, tradeAmount, zeroIsUSDC);
 
-        PoolId id = key.toId();
         settleSwapper(id, msg.sender);
 
         // (uint160 slot0_sqrtPriceX96, , , ) = poolManager.getSlot0(id);
@@ -463,10 +462,16 @@ contract PerpHook is PoolCallsHook {
             swapperProfitToCollateral(key, msg.sender);
         }
 
+        if (zeroIsUSDC) {
+            increaseMarginAmounts(id, levPositions[id][msg.sender].position1);
+        } else {
+            increaseMarginAmounts(id, levPositions[id][msg.sender].position0);
+        }
+
         emit Trade(msg.sender, tradeAmount);
     }
 
-    function doFundingMarginPayments(PoolKey memory key) internal {
+    function doFundingMarginPayments(PoolKey memory key) private {
         PoolId id = key.toId();
 
         while (block.timestamp > lastFundingTime[id] + 3600) {
@@ -477,6 +482,8 @@ contract PerpHook is PoolCallsHook {
             So divide by 87600 every hour to get payment
             1*10**18 / 87600 * 8760 = 1*10**17
             */
+
+            // TODO - need to convert amount to USDC...
             uint marginPayment = marginSwapsAbs[id] / 87600;
             if (marginPayment > 0) {
                 lpMarginFeesPerUnit[id] += marginPayment / lpLiqTotal[id];
@@ -550,11 +557,11 @@ contract PerpHook is PoolCallsHook {
     }
 
     /// @notice from https://ethereum.stackexchange.com/questions/84390/absolute-value-in-solidity
-    function abs(int128 x) internal pure returns (uint128) {
+    function abs(int128 x) private pure returns (uint128) {
         return x >= 0 ? uint128(x) : uint128(-x);
     }
 
-    function removeLiquidity(PoolKey memory key, int128 tradeAmount) internal {
+    function removeLiquidity(PoolKey memory key, int128 tradeAmount) private {
         // Hardcoding full tick range for now
         int24 tickLower = TickMath.minUsableTick(60);
         int24 tickUpper = TickMath.maxUsableTick(60);
@@ -587,5 +594,24 @@ contract PerpHook is PoolCallsHook {
             ),
             ""
         );
+    }
+
+    function decreaseMarginAmounts(PoolId id, int128 amountBase) private {
+        // These should track values in non-USDC token
+        marginSwapsAbs[id] -= abs(amountBase);
+        marginSwapsNet[id] -= amountBase;
+    }
+
+    function increaseMarginAmounts(PoolId id, int128 amountBase) private {
+        marginSwapsAbs[id] += abs(amountBase);
+        marginSwapsNet[id] += amountBase;
+
+        //if (zeroIsUSDC) {
+        //    marginSwapsAbs += abs(delta.amount1());
+        //    marginSwapsNet += delta.amount1();
+        //} else {
+        //    marginSwapsAbs += abs(delta.amount0());
+        //    marginSwapsNet += delta.amount0();
+        //}
     }
 }

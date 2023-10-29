@@ -546,7 +546,7 @@ contract PerpHook is PoolCallsHook {
         (uint160 sqrtPriceX96, , , ) = poolManager.getSlot0(id);
         bool zeroIsUSDC = Currency.unwrap(key.currency0) == colTokenAddr;
         // total amount of position values
-        uint256 amountUSDC = getUSDCValue(
+        uint256 amountUSDCAbs = getUSDCValue(
             zeroIsUSDC,
             sqrtPriceX96,
             marginSwapsAbs[id]
@@ -558,22 +558,38 @@ contract PerpHook is PoolCallsHook {
         So divide by 87600 every hour to get payment
         1*10**18 / 87600 * 8760 = 1*10**17
         */
-        uint marginPayment = amountUSDC / 87600;
+        uint256 marginPayment = amountUSDCAbs / 87600;
+        // No need to keep calculating if there's no payment
+        if (marginPayment == 0) {
+            return;
+        }
 
+        uint256 lpMarginAdj = marginPayment / lpLiqTotal[id];
+        uint256 swapMarginAdj = marginPayment / marginSwapsAbs[id];
+
+        /*
+        Scale funding payment proportional to net long/short exposure
+        17520 = 50% max payment
+        Needs more thinking since leveraged swappers will be charged even
+        if there is nobody with a position in the opposite direction
+        */
+        uint256 amountUSDCNet = getUSDCValue(
+            zeroIsUSDC,
+            sqrtPriceX96,
+            abs(int128(marginSwapsNet[id]))
+        );
+
+        int256 fundingPayment = int256(amountUSDCNet) / 17520;
+        if (marginSwapsNet[id] < 0) {
+            fundingPayment = -fundingPayment;
+        }
+        int256 swapFundingAdj = fundingPayment / marginSwapsNet[id];
+
+        // TODO - could remove loop and replace with calculations of adjustments
         while (block.timestamp > lastFundingTime[id] + 3600) {
-            if (marginPayment > 0) {
-                lpMarginFeesPerUnit[id] += marginPayment / lpLiqTotal[id];
-                swapMarginFeesPerUnit[id] += marginPayment / marginSwapsAbs[id];
-
-                int256 fundingPayment = marginSwapsNet[id] / 17520;
-                // Scale funding payment proportional to net long/short exposure
-                // 17520 = 50% max payment
-                // Note that this will be apply even if there's no
-                // other side of the trade?  What happens to the payment in the
-                // scenario where we have 1 position of +1000?
-                int256 payAdj = fundingPayment / marginSwapsNet[id];
-                swapFundingFeesPerUnit[id] += payAdj;
-            }
+            lpMarginFeesPerUnit[id] += lpMarginAdj;
+            swapMarginFeesPerUnit[id] += swapMarginAdj;
+            swapFundingFeesPerUnit[id] += swapFundingAdj;
 
             lastFundingTime[id] += 3600;
         }

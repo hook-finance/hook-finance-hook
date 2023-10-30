@@ -1,67 +1,48 @@
-# v4-template
-### **A template for writing Uniswap v4 Hooks 🦄**
+# Perp Hook
 
-[`Use this Template`](https://github.com/saucepoint/v4-template/generate)
+Proof of concept for a perpetual exchange built on a Uniswap Hook, built for the ETHGlobal online hackathon 2023.
 
-1. The example hook [Counter.sol](src/Counter.sol) demonstrates the `beforeSwap()` and `afterSwap()` hooks
-2. The test template [Counter.t.sol](test/Counter.t.sol) preconfigures the v4 pool manager, test tokens, and test liquidity.
+## Authors
 
----
+Hook by Thomas Redfern
 
-### Local Development (Anvil)
+Other ETHGlobal hackathon team members: Rashad Haddad, Tomas Taylor, Ash
 
-*requires [foundry](https://book.getfoundry.sh)*
+## Overview
 
+The hook combines mechanisms of both margin trading and perpetual exchanges to allow users to take leveraged positions.
+
+Regular swappers can interact with the pool, which helps maintain an efficient price.
+
+Leveraged swappers can deposit collateral (USDC), and then make swaps with up to 10x leverage.
+
+Leveraged swappers face two payments, the first is a margin payment of 10% annualized on the size of their position, made to LPs.  The second is a funding payment made between swappers depending on the total long/short exposure of the leveraged positions.
+
+## Mechanism
+
+Rather than staking directly to the pool, LPs send funds to the hook which manages the stakes.  Leveraged swaps are executed via actual trades in the pool.  Liquidity is withdrawn in order to execute the leveraged swap, with the result that any profit from this swap will be captured by the pool, so can be credited to the leveraged swapper, while any loss from the swap will be offset by the leveraged swapper's collateral.
+
+Initial leverage is set to 10x, and leveraged swappers can be liquidated if their position goes beyond 20x leverage.
+
+Positions are prevented from going underwater via the public `liquidateSwapper` function, which allows an liquidator to liquidate a position once it's beyond the 20x leverage point.  Liquidators receive a portion of the leveraged swapper's collateral in exchange for calling this function.
+
+
+## Usage
+
+Run tests via:
+`forge test`
+
+Hook can be deployed on Sepolia by first creating a .env file in the root directory with the following fields:
 ```
-forge install
-forge test
+SEPOLIA_RPC_URL=...
+PRIVATE_KEY=...
+ETHERSCAN_API_KEY=...
 ```
 
-Because v4 exceeds the bytecode limit of Ethereum and it's *business licensed*, we can only deploy & test hooks on [anvil](https://book.getfoundry.sh/anvil/).
-
-```bash
-# start anvil, with a larger code limit
-anvil --code-size-limit 30000
-
-# in a new terminal
-forge script script/Counter.s.sol \
-    --rpc-url http://localhost:8545 \
-    --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
-    --code-size-limit 30000 \
-    --broadcast
-```
-
----
-
-## Troubleshooting
+And then running the following command: 
+`forge script script/PerpHookSepolia.s.sol:PerpHookScript --rpc-url $SEPOLIA_RPC_URL --broadcast --verify`
 
 
-### *Permission Denied*
+### Disclaimer
 
-When installing dependencies with `forge install`, Github may throw a `Permission Denied` error
-
-Typically caused by missing Github SSH keys, and can be resolved by following the steps [here](https://docs.github.com/en/github/authenticating-to-github/connecting-to-github-with-ssh) 
-
-Or [adding the keys to your ssh-agent](https://docs.github.com/en/authentication/connecting-to-github-with-ssh/generating-a-new-ssh-key-and-adding-it-to-the-ssh-agent#adding-your-ssh-key-to-the-ssh-agent), if you have already uploaded SSH keys
-
-### Hook deployment failures
-
-Hook deployment failures are caused by incorrect flags or incorrect salt mining
-
-1. Verify the flags are in agreement:
-    * `getHookCalls()` returns the correct flags
-    * `flags` provided to `HookMiner.find(...)`
-    * In obscure cases where you're deploying multiple hooks (with the same flags), try setting `seed=1000` for ` HookMiner.find`
-2. Verify salt mining is correct:
-    * In **forge test**: the *deploye*r for: `new Hook{salt: salt}(...)` and `HookMiner.find(deployer, ...)` are the same. This will be `address(this)`. If using `vm.prank`, the deployer will be the pranking address
-    * In **forge script**: the deployer must be the CREATE2 Proxy: `0x4e59b44847b379578588920cA78FbF26c0B4956C`
-        * If anvil does not have the CREATE2 deployer, your foundry may be out of date. You can update it with `foundryup`
-
----
-
-Additional resources:
-
-[v4-periphery](https://github.com/uniswap/v4-periphery) contains advanced hook implementations that serve as a great reference
-
-[v4-core](https://github.com/uniswap/v4-core)
-
+This hook is very much a prototype and not production ready.  Among other issues the hook is vulnerable to a flash loan attack where an attacker could borrow funds to swap the price to an extreme value, allowing them to liquidate leveraged swappers at will.  Manipulations related to the funding rate mechanism are also possible, and management of liquidity has flaws.

@@ -641,7 +641,8 @@ contract PerpHook is PoolCallsHook {
         IPoolManager.ModifyPositionParams calldata,
         bytes calldata
     ) external override returns (bytes4) {
-        // TODO - enable this when we deploy, makes setup more challenging otherwise
+        // Can we block external calls to this function?
+        // msg.sender will be PoolManager?
         // require(
         //     msg.sender == address(this),
         //     "Only hook can deposit liquidity!"

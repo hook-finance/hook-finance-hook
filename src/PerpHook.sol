@@ -636,17 +636,13 @@ contract PerpHook is PoolCallsHook {
     }
 
     function beforeModifyPosition(
-        address,
+        address sender,
         PoolKey calldata key,
         IPoolManager.ModifyPositionParams calldata,
         bytes calldata
     ) external override returns (bytes4) {
-        // Can we block external calls to this function?
-        // msg.sender will be PoolManager?
-        // require(
-        //     msg.sender == address(this),
-        //     "Only hook can deposit liquidity!"
-        // );
+        // Block external calls to this function - don't allow external mints
+        require(sender == address(this), "Only hook can deposit liquidity!");
         doFundingMarginPayments(key);
         return BaseHook.beforeModifyPosition.selector;
     }

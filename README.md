@@ -2,6 +2,8 @@
 
 Proof of concept for a perpetual exchange built on a Uniswap Hook, built for the ETHGlobal online hackathon 2023.
 
+Won Uniswap Hookathon prize.
+
 ## Authors
 
 Hook by Thomas Redfern
@@ -28,6 +30,8 @@ Positions are prevented from going underwater via the public `liquidateSwapper` 
 
 
 ## Usage
+Install packages via:
+`forge install`
 
 Run tests via:
 `forge test`

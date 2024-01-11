@@ -2,31 +2,27 @@
 pragma solidity ^0.8.19;
 
 import {BaseHook} from "v4-periphery/BaseHook.sol";
-
-import {Hooks} from "@uniswap/v4-core/contracts/libraries/Hooks.sol";
 import {IPoolManager} from "@uniswap/v4-core/contracts/interfaces/IPoolManager.sol";
 import {PoolKey} from "@uniswap/v4-core/contracts/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/contracts/types/PoolId.sol";
-import {BalanceDelta, toBalanceDelta} from "@uniswap/v4-core/contracts/types/BalanceDelta.sol";
-import {PoolModifyPositionTest} from "@uniswap/v4-core/contracts/test/PoolModifyPositionTest.sol";
+import {BalanceDelta} from "@uniswap/v4-core/contracts/types/BalanceDelta.sol";
 import {TickMath} from "@uniswap/v4-core/contracts/libraries/TickMath.sol";
+import {FullMath} from "@uniswap/v4-core/contracts/libraries/FullMath.sol";
+import {FixedPoint96} from "@uniswap/v4-core/contracts/libraries/FixedPoint96.sol";
 import {TestERC20} from "@uniswap/v4-core/contracts/test/TestERC20.sol";
+
 import {CurrencyLibrary, Currency} from "@uniswap/v4-core/contracts/types/Currency.sol";
-// import {Position} from "@uniswap/v4-core/contracts/libraries/Position.sol";
-import {SqrtPriceMath} from "@uniswap/v4-core/contracts/libraries/SqrtPriceMath.sol";
-import {SafeCast} from "@uniswap/v4-core/contracts/libraries/SafeCast.sol";
-// import {LiquidityAmounts} from "@uniswap/v4-periphery/contracts/libraries/LiquidityAmounts.sol";
-import {LiquidityAmounts} from "lib/v4-periphery/contracts/libraries/LiquidityAmounts.sol";
+import {PoolCallsHook} from "./PoolCallsHook.sol";
+import {UniHelpers} from "./UniHelpers.sol";
 
 // import "forge-std/console2.sol";
 
-contract PerpHook is BaseHook {
-    using SafeCast for *;
+contract PerpHook is PoolCallsHook {
     using PoolIdLibrary for PoolKey;
     using CurrencyLibrary for Currency;
 
     // By keeping track of result of swaps executed on behalf of user we can track profits
-    struct LeveragedPosition {
+    struct SwapperPosition {
         int128 position0;
         int128 position1;
         uint256 startSwapMarginFeesPerUnit;
@@ -36,26 +32,6 @@ contract PerpHook is BaseHook {
     struct LPPosition {
         uint256 liquidity;
         uint256 startLpMarginFeesPerUnit;
-    }
-
-    struct CallbackDataModPos {
-        address sender;
-        PoolKey key;
-        IPoolManager.ModifyPositionParams params;
-        bytes hookData;
-    }
-
-    struct CallbackDataSwap {
-        address sender;
-        TestSettingsSwap testSettings;
-        PoolKey key;
-        IPoolManager.SwapParams params;
-        bytes hookData;
-    }
-
-    struct TestSettingsSwap {
-        bool withdrawTokens;
-        bool settleUsingTransfer;
     }
 
     // NOTE: ---------------------------------------------------------
@@ -70,8 +46,7 @@ contract PerpHook is BaseHook {
     mapping(PoolId => mapping(address => uint256)) public collateral;
     // Profits from margin fees paid to LPs - will represent amount in USDC
     mapping(PoolId => mapping(address => uint256)) public lpProfits;
-    mapping(PoolId => mapping(address => LeveragedPosition))
-        public levPositions;
+    mapping(PoolId => mapping(address => SwapperPosition)) public levPositions;
 
     mapping(PoolId => mapping(address => LPPosition)) public lpPositions;
 
@@ -91,10 +66,8 @@ contract PerpHook is BaseHook {
     // keep track of funding fees owed between swappers
     mapping(PoolId => int256) public swapFundingFeesPerUnit;
 
-    uint8 whichLock;
-
     // Only accepting one token as collateral for now, set to USDC by default
-    address colTokenAddr;
+    address public colTokenAddr;
 
     event Mint(address indexed minter, int256 amount);
     event Burn(address indexed burner, int256 amount);
@@ -110,27 +83,13 @@ contract PerpHook is BaseHook {
     constructor(
         IPoolManager _poolManager,
         address _colTokenAddr
-    ) BaseHook(_poolManager) {
+    ) PoolCallsHook(_poolManager) {
         // swapRouter = new PoolSwapTest(_poolManager);
         colTokenAddr = _colTokenAddr;
     }
 
-    function getHooksCalls() public pure override returns (Hooks.Calls memory) {
-        return
-            Hooks.Calls({
-                beforeInitialize: true,
-                afterInitialize: false,
-                beforeModifyPosition: true,
-                afterModifyPosition: false,
-                beforeSwap: true,
-                afterSwap: false,
-                beforeDonate: false,
-                afterDonate: false
-            });
-    }
-
     /// @notice manage margin and funding payments for swappers
-    function settleSwapper(PoolId id, address addrSwapper) internal {
+    function settleSwapper(PoolId id, address addrSwapper) private {
         uint256 marginFeesPerUnit = swapMarginFeesPerUnit[id] -
             levPositions[id][addrSwapper].startSwapMarginFeesPerUnit;
         uint256 marginPaid = marginFeesPerUnit *
@@ -150,7 +109,7 @@ contract PerpHook is BaseHook {
     }
 
     /// @notice manage margin payments to LPs
-    function settleLP(PoolId id, address addrLP) internal {
+    function settleLP(PoolId id, address addrLP) private {
         // Need to add all their margin fees to profits
         // so move current fees to profits...
         uint marginFeesPerUnit = lpMarginFeesPerUnit[id] -
@@ -165,22 +124,39 @@ contract PerpHook is BaseHook {
 
         // We can just execute the swap and confirm that it was a valid liquidation
         // based on amounts post-swap, and revert if it's invalid
-        int128 tradeAmount = -levPositions[id][liqSwapper].position0;
-        BalanceDelta delta = execMarginTrade(key, tradeAmount);
-        // This is the current position value
-        int128 positionVal = delta.amount1();
+
+        bool zeroIsUSDC = Currency.unwrap(key.currency0) == colTokenAddr;
+        int128 tradeAmount;
+        if (zeroIsUSDC) {
+            tradeAmount = -levPositions[id][liqSwapper].position1;
+            decreaseMarginAmounts(id, levPositions[id][liqSwapper].position1);
+        } else {
+            tradeAmount = -levPositions[id][liqSwapper].position0;
+            decreaseMarginAmounts(id, levPositions[id][liqSwapper].position0);
+        }
+
+        BalanceDelta delta = execMarginTrade(key, tradeAmount, zeroIsUSDC);
 
         settleSwapper(id, liqSwapper);
-
         uint256 swapperCol = collateral[id][liqSwapper];
-        LeveragedPosition memory swapperPos = levPositions[id][liqSwapper];
-        int128 profit = positionVal - swapperPos.position1;
+        SwapperPosition memory swapperPos = levPositions[id][liqSwapper];
+
+        // This will be the current position value
+        int128 positionVal;
+        int128 profitUSDC;
+        if (zeroIsUSDC) {
+            positionVal = delta.amount0();
+            profitUSDC = positionVal - swapperPos.position0;
+        } else {
+            positionVal = delta.amount1();
+            profitUSDC = positionVal - swapperPos.position1;
+        }
 
         uint remainingCollateral;
-        if (profit < 0) {
-            remainingCollateral = swapperCol - uint128(-profit);
+        if (profitUSDC < 0) {
+            remainingCollateral = swapperCol - uint128(-profitUSDC);
         } else {
-            remainingCollateral = swapperCol + uint128(profit);
+            remainingCollateral = swapperCol + uint128(profitUSDC);
         }
 
         // Must be greater than 20x leverage in order to liquidate!
@@ -203,7 +179,9 @@ contract PerpHook is BaseHook {
             .startSwapFundingFeesPerUnit = swapFundingFeesPerUnit[id];
 
         // This should take care of calculating current swapper collateral
-        profitToCollateral(key, liqSwapper);
+        swapperProfitToCollateral(key, liqSwapper);
+
+        // Don't need to call increaseMarginAmounts because position must be 0!
 
         emit Liquidate(msg.sender, liqSwapper, tradeAmount);
     }
@@ -220,28 +198,6 @@ contract PerpHook is BaseHook {
         PoolId id = key.toId();
         collateral[id][msg.sender] += depositAmount;
         emit Deposit(msg.sender, depositAmount);
-    }
-
-    /// @notice If position is flat calculate profit and move it to collateral
-    function profitToCollateral(
-        PoolKey memory key,
-        address addrSwapper
-    ) internal {
-        PoolId id = key.toId();
-        require(
-            levPositions[id][addrSwapper].position0 == 0,
-            "Positions must be closed!"
-        );
-        if (levPositions[id][addrSwapper].position1 > 0) {
-            collateral[id][addrSwapper] += uint128(
-                levPositions[id][addrSwapper].position1
-            );
-        } else {
-            collateral[id][addrSwapper] += uint128(
-                -levPositions[id][addrSwapper].position1
-            );
-        }
-        levPositions[id][addrSwapper].position1 = 0;
     }
 
     function withdrawCollateral(
@@ -265,68 +221,44 @@ contract PerpHook is BaseHook {
         emit Withdraw(msg.sender, withdrawAmount);
     }
 
-    /// @notice Copy/paste from 'modifyPosition' function in Pool.sol, needed so we can transfer funds from LP to stake ourselves
-    function getMintBalanceDelta(
-        int24 tickLower,
-        int24 tickUpper,
-        //int256 liquidityDelta,
-        int128 liquidityDelta,
-        int24 slot0_tick,
-        uint160 slot0_sqrtPriceX96
-    ) internal pure returns (BalanceDelta result) {
-        // NOTE - function assumes hookFees are 0,
-        // if that changes need to add extra logic from Pool.sol function
-        if (liquidityDelta != 0) {
-            if (slot0_tick < tickLower) {
-                // current tick is below the passed range; liquidity can only become in range by crossing from left to
-                // right, when we'll need _more_ currency0 (it's becoming more valuable) so user must provide it
-                result =
-                    result +
-                    toBalanceDelta(
-                        SqrtPriceMath
-                            .getAmount0Delta(
-                                TickMath.getSqrtRatioAtTick(tickLower),
-                                TickMath.getSqrtRatioAtTick(tickUpper),
-                                liquidityDelta
-                            )
-                            .toInt128(),
-                        0
-                    );
-            } else if (slot0_tick < tickUpper) {
-                result =
-                    result +
-                    toBalanceDelta(
-                        SqrtPriceMath
-                            .getAmount0Delta(
-                                slot0_sqrtPriceX96,
-                                TickMath.getSqrtRatioAtTick(tickUpper),
-                                liquidityDelta
-                            )
-                            .toInt128(),
-                        SqrtPriceMath
-                            .getAmount1Delta(
-                                TickMath.getSqrtRatioAtTick(tickLower),
-                                slot0_sqrtPriceX96,
-                                liquidityDelta
-                            )
-                            .toInt128()
-                    );
+    /// @notice If position is flat calculate profit and move it to collateral
+    function swapperProfitToCollateral(
+        PoolKey memory key,
+        address addrSwapper
+    ) private {
+        PoolId id = key.toId();
+
+        bool zeroIsUSDC = Currency.unwrap(key.currency0) == colTokenAddr;
+        if (zeroIsUSDC) {
+            require(
+                levPositions[id][addrSwapper].position1 == 0,
+                "Positions must be closed!"
+            );
+            if (levPositions[id][addrSwapper].position0 > 0) {
+                collateral[id][addrSwapper] += uint128(
+                    levPositions[id][addrSwapper].position0
+                );
             } else {
-                // current tick is above the passed range; liquidity can only become in range by crossing from right to
-                // left, when we'll need _more_ currency1 (it's becoming more valuable) so user must provide it
-                result =
-                    result +
-                    toBalanceDelta(
-                        0,
-                        SqrtPriceMath
-                            .getAmount1Delta(
-                                TickMath.getSqrtRatioAtTick(tickLower),
-                                TickMath.getSqrtRatioAtTick(tickUpper),
-                                liquidityDelta
-                            )
-                            .toInt128()
-                    );
+                collateral[id][addrSwapper] += uint128(
+                    -levPositions[id][addrSwapper].position0
+                );
             }
+            levPositions[id][addrSwapper].position0 = 0;
+        } else {
+            require(
+                levPositions[id][addrSwapper].position0 == 0,
+                "Positions must be closed!"
+            );
+            if (levPositions[id][addrSwapper].position1 > 0) {
+                collateral[id][addrSwapper] += uint128(
+                    levPositions[id][addrSwapper].position1
+                );
+            } else {
+                collateral[id][addrSwapper] += uint128(
+                    -levPositions[id][addrSwapper].position1
+                );
+            }
+            levPositions[id][addrSwapper].position1 = 0;
         }
     }
 
@@ -362,14 +294,20 @@ contract PerpHook is BaseHook {
 
         TestERC20 token0 = TestERC20(Currency.unwrap(key.currency0));
         TestERC20 token1 = TestERC20(Currency.unwrap(key.currency1));
-        // Return tokens to sender...
-        token0.transfer(msg.sender, uint128(delta.amount0()));
 
-        // Include margin fees in this transfer
-        token1.transfer(
-            msg.sender,
-            uint128(delta.amount1()) + lpProfits[id][msg.sender]
-        );
+        uint128 send0 = uint128(delta.amount0());
+        uint128 send1 = uint128(delta.amount1());
+
+        // Include profits from whichever one was USDC
+        if (address(token0) == colTokenAddr) {
+            send0 += uint128(lpProfits[id][msg.sender]);
+        } else {
+            send1 += uint128(lpProfits[id][msg.sender]);
+        }
+
+        token0.transfer(msg.sender, send0);
+        token1.transfer(msg.sender, send1);
+
         lpProfits[id][msg.sender] = 0;
 
         emit Burn(msg.sender, liquidityDelta);
@@ -399,7 +337,7 @@ contract PerpHook is BaseHook {
         // }
 
         // Need to precompute balance deltas so we can take funds from LP to stake ourselves
-        BalanceDelta deltaPred = getMintBalanceDelta(
+        BalanceDelta deltaPred = UniHelpers.getMintBalanceDelta(
             tickLower,
             tickUpper,
             liquidityDelta,
@@ -410,8 +348,7 @@ contract PerpHook is BaseHook {
         TestERC20 token0 = TestERC20(Currency.unwrap(key.currency0));
         TestERC20 token1 = TestERC20(Currency.unwrap(key.currency1));
 
-        // Because we're minting these values will always be positive, so uint128 cast is safe
-        // TODO - better understand what is going on here - if we comment out the token1 transfer it still works!?
+        // Because we're minting values will always be positive, so uint128 cast is safe
         token0.transferFrom(
             msg.sender,
             address(this),
@@ -445,63 +382,274 @@ contract PerpHook is BaseHook {
         emit Mint(msg.sender, liquidityDelta);
     }
 
-    /// @notice Copied from uni-v3 LiquidityManagement.sol 'addLiquidity' function
-    function getLiquidityFromAmounts(
-        uint160 sqrtPriceX96,
-        int24 tickLower,
-        int24 tickUpper,
-        uint256 amount0Desired,
-        uint256 amount1Desired
-    ) internal pure returns (uint128) {
-        // compute liquidity amount given some amount0 and amount1
-        //(uint160 sqrtPriceX96, , , , , , ) = pool.slot0();
+    function execMarginTrade(
+        PoolKey memory key,
+        int128 tradeAmount,
+        bool zeroIsUSDC
+    ) private returns (BalanceDelta delta) {
+        removeLiquidity(key, tradeAmount);
 
-        uint160 sqrtRatioAX96 = TickMath.getSqrtRatioAtTick(tickLower);
-        uint160 sqrtRatioBX96 = TickMath.getSqrtRatioAtTick(tickUpper);
+        bool zeroForOne;
+        if (zeroIsUSDC) {
+            zeroForOne = tradeAmount > 0 ? false : true;
+        } else {
+            zeroForOne = tradeAmount > 0 ? true : false;
+        }
+        IPoolManager.SwapParams memory params = IPoolManager.SwapParams({
+            zeroForOne: zeroForOne,
+            amountSpecified: tradeAmount,
+            sqrtPriceLimitX96: zeroForOne
+                ? TickMath.MIN_SQRT_RATIO + 1
+                : TickMath.MAX_SQRT_RATIO - 1 // unlimited impact
+        });
 
-        uint128 liquidity = LiquidityAmounts.getLiquidityForAmounts(
-            sqrtPriceX96,
-            sqrtRatioAX96,
-            sqrtRatioBX96,
-            amount0Desired,
-            amount1Desired
-        );
-        return liquidity;
+        SettingsSwap memory testSettings = SettingsSwap({
+            withdrawTokens: true,
+            settleUsingTransfer: true
+        });
+
+        delta = swap(key, params, testSettings, "");
     }
 
-    function removeLiquidity(PoolKey memory key, int128 tradeAmount) internal {
-        // Hardcoding full tick range for now
-        int24 tickLower = TickMath.minUsableTick(60);
-        int24 tickUpper = TickMath.maxUsableTick(60);
-
+    /// @notice Allow a user (who has already deposited collateral) to execute a leveraged trade
+    function marginTrade(
+        PoolKey memory key,
+        int128 tradeAmount
+    ) external payable {
+        bool zeroIsUSDC = Currency.unwrap(key.currency0) == colTokenAddr;
         PoolId id = key.toId();
-        (uint160 slot0_sqrtPriceX96, , , ) = poolManager.getSlot0(id);
+        if (zeroIsUSDC) {
+            decreaseMarginAmounts(id, levPositions[id][msg.sender].position1);
+        } else {
+            decreaseMarginAmounts(id, levPositions[id][msg.sender].position0);
+        }
+        BalanceDelta delta = execMarginTrade(key, tradeAmount, zeroIsUSDC);
 
-        uint256 amount0Desired;
-        uint256 amount1Desired;
-        // tradeAmount is ALWAYS amount0?
-        // When we trade oneForZero will we get exact amount though?
-        amount0Desired = uint128(abs(tradeAmount));
-        amount1Desired = 2 ** 64;
+        settleSwapper(id, msg.sender);
 
-        // FIgure out how much we have to remove to do the swap...
-        uint256 liquidity = getLiquidityFromAmounts(
-            slot0_sqrtPriceX96,
-            tickLower,
-            tickUpper,
-            amount0Desired,
-            amount1Desired
+        // (uint160 slot0_sqrtPriceX96, , , ) = poolManager.getSlot0(id);
+
+        // sqrtPriceXs are uint160 - possible but unlikely this will overflow?
+        // Actually - when all liquidity is taken think sqrtPriceX96 goes to extreme
+        // In that case think it would overflow?
+        // Don't need this value if we rely on external liquidators
+        // uint256 liqSqrtPriceX = sqrt(
+        //     (uint256(slot0_sqrtPriceX96) * uint256(slot0_sqrtPriceX96)) * ratio
+        // );
+
+        // Should we store liquidation prices at tick level instead?
+        // TickMath.getTickAtSqrtRatio(uint160 sqrtPriceX96)
+
+        // Track our positions
+        levPositions[id][msg.sender].position0 += delta.amount0();
+        levPositions[id][msg.sender].position1 += delta.amount1();
+
+        (uint160 sqrtPriceX96, , , ) = poolManager.getSlot0(id);
+        uint256 baseAmount = zeroIsUSDC
+            ? abs(levPositions[id][msg.sender].position1)
+            : abs(levPositions[id][msg.sender].position0);
+        uint256 amountUSDC = getUSDCValue(zeroIsUSDC, sqrtPriceX96, baseAmount);
+
+        if (zeroIsUSDC) {
+            uint256 sqrtAmount = sqrt(
+                abs(levPositions[id][msg.sender].position1)
+            );
+            amountUSDC = FullMath.mulDiv(
+                sqrtAmount,
+                FixedPoint96.Q96,
+                sqrtPriceX96
+            );
+            amountUSDC = amountUSDC * amountUSDC;
+        } else {
+            uint256 sqrtAmount = sqrt(
+                abs(levPositions[id][msg.sender].position0)
+            );
+            amountUSDC = FullMath.mulDiv(
+                sqrtPriceX96,
+                sqrtAmount,
+                FixedPoint96.Q96
+            );
+            amountUSDC = amountUSDC * amountUSDC;
+        }
+        // Saying 10x initial margin
+        uint collateral10x = collateral[id][msg.sender] * 10;
+        require(collateral10x >= amountUSDC, "Not enough collateral");
+
+        levPositions[id][msg.sender]
+            .startSwapMarginFeesPerUnit = swapMarginFeesPerUnit[id];
+        levPositions[id][msg.sender]
+            .startSwapFundingFeesPerUnit = swapFundingFeesPerUnit[id];
+
+        // If they've closed their position, calculate their profit and add to collateral
+
+        bool cond1 = (zeroIsUSDC &&
+            (levPositions[id][msg.sender].position1 == 0));
+        bool cond2 = (!zeroIsUSDC &&
+            (levPositions[id][msg.sender].position0 == 0));
+        if (cond1 || cond2) {
+            swapperProfitToCollateral(key, msg.sender);
+        }
+
+        if (zeroIsUSDC) {
+            increaseMarginAmounts(id, levPositions[id][msg.sender].position1);
+        } else {
+            increaseMarginAmounts(id, levPositions[id][msg.sender].position0);
+        }
+
+        emit Trade(msg.sender, tradeAmount);
+    }
+
+    /// @notice Converts base amount to USDC amount, using pool sqrtPriceX96 as the price
+    function getUSDCValue(
+        bool zeroIsUSDC,
+        uint160 sqrtPriceX96,
+        uint256 baseAmount
+    ) private pure returns (uint256 amountUSDC) {
+        /*
+        Use sqrtPriceX96 as price for conversions in a couple spots
+        We want price*position to get value of position in USDC
+        price = (sqrtPriceX96 / 2**96)**2
+
+        If USDC is token0 formula is:
+        ((math.sqrt(amount) * 2**96) / sqrtPrice) ** 2
+        If USDC is token1 formula is:
+        ((sqrtPriceX96 * math.sqrt(amount)) / 2**96) ** 2
+
+        Think overflow shouldn't be a concern since we use sqrtAmount?
+        */
+
+        uint256 sqrtAmount = sqrt(baseAmount);
+        if (zeroIsUSDC) {
+            // baseAmount should be
+            // abs(levPositions[id][msg.sender].position1)
+            amountUSDC = FullMath.mulDiv(
+                sqrtAmount,
+                FixedPoint96.Q96,
+                sqrtPriceX96
+            );
+        } else {
+            // baseAmount should be
+            // abs(levPositions[id][msg.sender].position0)
+            amountUSDC = FullMath.mulDiv(
+                sqrtPriceX96,
+                sqrtAmount,
+                FixedPoint96.Q96
+            );
+        }
+        amountUSDC = amountUSDC * amountUSDC;
+    }
+
+    function doFundingMarginPayments(PoolKey memory key) private {
+        PoolId id = key.toId();
+        uint256 num_funding_periods = (block.timestamp - lastFundingTime[id]) /
+            3600;
+        if (num_funding_periods == 0) {
+            return;
+        }
+        lastFundingTime[id] += (num_funding_periods * 3600);
+
+        (uint160 sqrtPriceX96, , , ) = poolManager.getSlot0(id);
+        bool zeroIsUSDC = Currency.unwrap(key.currency0) == colTokenAddr;
+        // total amount of position values
+        uint256 amountUSDCAbs = getUSDCValue(
+            zeroIsUSDC,
+            sqrtPriceX96,
+            marginSwapsAbs[id]
+        );
+        /*
+        margin fee:
+        10% annual on position size, charged hourly
+        365*24 = 8760 periods
+        So divide by 87600 every hour to get payment
+        1*10**18 / 87600 * 8760 = 1*10**17
+        */
+        uint256 marginPayment = amountUSDCAbs / 87600;
+        // No need to keep calculating if there's no payment
+        if (marginPayment == 0) {
+            return;
+        }
+
+        uint256 lpMarginAdj = marginPayment / lpLiqTotal[id];
+        uint256 swapMarginAdj = marginPayment / marginSwapsAbs[id];
+
+        /*
+        Scale funding payment proportional to net long/short exposure
+        17520 = 50% max payment
+        Needs more thinking since leveraged swappers will be charged even
+        if there is nobody with a position in the opposite direction
+        */
+        uint256 amountUSDCNet = getUSDCValue(
+            zeroIsUSDC,
+            sqrtPriceX96,
+            abs(int128(marginSwapsNet[id]))
         );
 
-        modifyPosition(
-            key,
-            IPoolManager.ModifyPositionParams(
-                tickLower,
-                tickUpper,
-                -int256(liquidity)
-            ),
-            ""
+        int256 fundingPayment = int256(amountUSDCNet) / 17520;
+        if (marginSwapsNet[id] < 0) {
+            fundingPayment = -fundingPayment;
+        }
+        int256 swapFundingAdj = fundingPayment / marginSwapsNet[id];
+
+        lpMarginFeesPerUnit[id] += lpMarginAdj * num_funding_periods;
+        swapMarginFeesPerUnit[id] += swapMarginAdj * num_funding_periods;
+        swapFundingFeesPerUnit[id] +=
+            swapFundingAdj *
+            int256(num_funding_periods);
+    }
+
+    // -----------------------------------------------
+    // NOTE: see IHooks.sol for function documentation
+    // -----------------------------------------------
+
+    function beforeInitialize(
+        address,
+        PoolKey calldata key,
+        uint160,
+        bytes calldata
+    ) external override returns (bytes4) {
+        PoolId id = key.toId();
+        address token0 = Currency.unwrap(key.currency0);
+        address token1 = Currency.unwrap(key.currency1);
+        require(
+            token0 == colTokenAddr || token1 == colTokenAddr,
+            "Must have USDC pair!"
         );
+        // Transfer logic is hardcoded for erc20s so disable ETH for now
+        require(
+            token0 != address(0) && token1 != address(0),
+            "Cannot have ETH pair!"
+        );
+
+        // Round down to nearest hour
+        lastFundingTime[id] = (block.timestamp / (3600)) * 3600;
+        return BaseHook.beforeInitialize.selector;
+    }
+
+    function beforeSwap(
+        address,
+        PoolKey calldata key,
+        IPoolManager.SwapParams calldata,
+        bytes calldata
+    ) external override returns (bytes4) {
+        doFundingMarginPayments(key);
+        return BaseHook.beforeSwap.selector;
+    }
+
+    function beforeModifyPosition(
+        address sender,
+        PoolKey calldata key,
+        IPoolManager.ModifyPositionParams calldata,
+        bytes calldata
+    ) external override returns (bytes4) {
+        // Block external calls to this function - don't allow external mints
+        require(sender == address(this), "Only hook can deposit liquidity!");
+        doFundingMarginPayments(key);
+        return BaseHook.beforeModifyPosition.selector;
+    }
+
+    /// @notice from https://ethereum.stackexchange.com/questions/84390/absolute-value-in-solidity
+    function abs(int128 x) private pure returns (uint128) {
+        return x >= 0 ? uint128(x) : uint128(-x);
     }
 
     /// @notice from https://ethereum.stackexchange.com/questions/2910/can-i-square-root-in-solidity
@@ -559,395 +707,57 @@ contract PerpHook is BaseHook {
         }
     }
 
-    /// @notice from https://ethereum.stackexchange.com/questions/84390/absolute-value-in-solidity
-    function abs(int128 x) private pure returns (uint128) {
-        return x >= 0 ? uint128(x) : uint128(-x);
-    }
-
-    function execMarginTrade(
-        PoolKey memory key,
-        int128 tradeAmount
-    ) internal returns (BalanceDelta delta) {
-        removeLiquidity(key, tradeAmount);
-
-        /*
-        We're expressing tradeAmount as the trade size in token0, where a positive
-        number represents a long position, while a negative number represents a
-        short position, but when actually executing we have to use (-tradeAmount),
-        since for the pool logic if we have:
-        zeroForOne = true
-        tradeAmount = 100 (or any positive number)
-        it means we'll swap 100 token0s for token1s, so this is actually SELLING token0
-        */
-        bool zeroForOne = tradeAmount > 0 ? false : true;
-        IPoolManager.SwapParams memory params = IPoolManager.SwapParams({
-            zeroForOne: zeroForOne,
-            amountSpecified: -tradeAmount,
-            sqrtPriceLimitX96: zeroForOne
-                ? TickMath.MIN_SQRT_RATIO + 1
-                : TickMath.MAX_SQRT_RATIO - 1 // unlimited impact
-        });
-
-        TestSettingsSwap memory testSettings = TestSettingsSwap({
-            withdrawTokens: true,
-            settleUsingTransfer: true
-        });
-
-        delta = swap(key, params, testSettings, "");
-    }
-
-    /// @notice Allow a user (who has already deposited collateral) to execute a leveraged trade
-    function marginTrade(
-        PoolKey memory key,
-        int128 tradeAmount
-    ) external payable {
-        BalanceDelta delta = execMarginTrade(key, tradeAmount);
+    function removeLiquidity(PoolKey memory key, int128 tradeAmount) private {
+        // Hardcoding full tick range for now
+        int24 tickLower = TickMath.minUsableTick(60);
+        int24 tickUpper = TickMath.maxUsableTick(60);
 
         PoolId id = key.toId();
-        settleSwapper(id, msg.sender);
+        (uint160 slot0_sqrtPriceX96, , , ) = poolManager.getSlot0(id);
 
-        // token1 amount is our trade size
-        // Assumes token1 will always be USDC - in reality we cannot make this
-        // assumption, even if all pairs have USDC it could be token0 or token1
-        uint128 amountUSDC = abs(delta.amount1());
+        uint256 amount0Desired;
+        uint256 amount1Desired;
+        // tradeAmount is ALWAYS amount0?
+        // When we trade oneForZero will we get exact amount though?
+        amount0Desired = uint128(abs(tradeAmount));
+        amount1Desired = 2 ** 64;
 
-        // Remember - collateral is also in USDC
-        // Saying max 20x leverage - we'll liquidate at that point
-        uint collateral20x = collateral[id][msg.sender] * 20;
+        // FIgure out how much we have to remove to do the swap...
+        uint256 liquidity = UniHelpers.getLiquidityFromAmounts(
+            slot0_sqrtPriceX96,
+            tickLower,
+            tickUpper,
+            amount0Desired,
+            amount1Desired
+        );
 
-        // Should we multiply by 10^x to get better precision?
-        uint ratio = collateral20x / amountUSDC;
-        // Saying 10x initial leverage requirement
-        // require(amountUSDC <= collateral20x / 2);
-        require(ratio >= 2, "Not enough collateral");
-
-        // (uint160 slot0_sqrtPriceX96, , , ) = poolManager.getSlot0(id);
-
-        // sqrtPriceXs are uint160 - possible but unlikely this will overflow?
-        // Actually - when all liquidity is taken think sqrtPriceX96 goes to extreme
-        // In that case think it would overflow?
-        // Don't need this value if we rely on external liquidators
-        // uint256 liqSqrtPriceX = sqrt(
-        //     (uint256(slot0_sqrtPriceX96) * uint256(slot0_sqrtPriceX96)) * ratio
-        // );
-
-        // Should we store liquidation prices at tick level instead?
-        // TickMath.getTickAtSqrtRatio(uint160 sqrtPriceX96)
-
-        // Track our positions
-        levPositions[id][msg.sender].position0 += delta.amount0();
-        levPositions[id][msg.sender].position1 += delta.amount1();
-
-        levPositions[id][msg.sender]
-            .startSwapMarginFeesPerUnit = swapMarginFeesPerUnit[id];
-        levPositions[id][msg.sender]
-            .startSwapFundingFeesPerUnit = swapFundingFeesPerUnit[id];
-
-        // If they've closed their position, calculate their profit and add to collateral
-        if (levPositions[id][msg.sender].position0 == 0) {
-            profitToCollateral(key, msg.sender);
-        }
-
-        emit Trade(msg.sender, tradeAmount);
-    }
-
-    function doFundingMarginPayments(PoolKey memory key) internal {
-        PoolId id = key.toId();
-
-        while (block.timestamp > lastFundingTime[id] + 3600) {
-            /*
-            margin fee:
-            10% annual on position size, charged hourly
-            365*24 = 8760 periods
-            So divide by 87600 every hour to get payment
-            1*10**18 / 87600 * 8760 = 1*10**17
-            */
-            uint marginPayment = marginSwapsAbs[id] / 87600;
-            if (marginPayment > 0) {
-                lpMarginFeesPerUnit[id] += marginPayment / lpLiqTotal[id];
-                swapMarginFeesPerUnit[id] += marginPayment / marginSwapsAbs[id];
-
-                int256 fundingPayment = marginSwapsNet[id] / 17520;
-                // Scale funding payment proportional to net long/short exposure
-                // 17520 = 50% max payment
-                // Note that this will be apply even if there's no
-                // other side of the trade?  What happens to the payment in the
-                // scenario where we have 1 position of +1000?
-                int256 payAdj = fundingPayment / marginSwapsNet[id];
-                swapFundingFeesPerUnit[id] += payAdj;
-            }
-
-            lastFundingTime[id] += 3600;
-        }
-    }
-
-    // -----------------------------------------------
-    // NOTE: see IHooks.sol for function documentation
-    // -----------------------------------------------
-
-    function beforeInitialize(
-        address,
-        PoolKey calldata key,
-        uint160,
-        bytes calldata
-    ) external override returns (bytes4) {
-        PoolId id = key.toId();
-        // Round down to nearest hour
-        lastFundingTime[id] = (block.timestamp / (3600)) * 3600;
-        return BaseHook.beforeInitialize.selector;
-    }
-
-    function beforeSwap(
-        address,
-        PoolKey calldata key,
-        IPoolManager.SwapParams calldata,
-        bytes calldata
-    ) external override returns (bytes4) {
-        doFundingMarginPayments(key);
-        return BaseHook.beforeSwap.selector;
-    }
-
-    function beforeModifyPosition(
-        address,
-        PoolKey calldata key,
-        IPoolManager.ModifyPositionParams calldata,
-        bytes calldata
-    ) external override returns (bytes4) {
-        // TODO - enable this when we deploy, makes setup more challenging otherwise
-        // require(
-        //     msg.sender == address(this),
-        //     "Only hook can deposit liquidity!"
-        // );
-        doFundingMarginPayments(key);
-        return BaseHook.beforeModifyPosition.selector;
-    }
-
-    /// @notice Copy/paste from PoolModifyPositionTest - we need it here because we want msg.sender to be our hook when we mint
-    function modifyPosition(
-        PoolKey memory key,
-        IPoolManager.ModifyPositionParams memory params,
-        bytes memory hookData
-    ) internal returns (BalanceDelta delta) {
-        whichLock = 1;
-        delta = abi.decode(
-            poolManager.lock(
-                abi.encode(
-                    CallbackDataModPos(msg.sender, key, params, hookData)
-                )
+        modifyPosition(
+            key,
+            IPoolManager.ModifyPositionParams(
+                tickLower,
+                tickUpper,
+                -int256(liquidity)
             ),
-            (BalanceDelta)
+            ""
         );
-
-        uint256 ethBalance = address(this).balance;
-        if (ethBalance > 0) {
-            CurrencyLibrary.NATIVE.transfer(msg.sender, ethBalance);
-        }
     }
 
-    /// @notice Copy/paste from PoolSwapTest - simplifies structure having it here
-    function swap(
-        PoolKey memory key,
-        IPoolManager.SwapParams memory params,
-        TestSettingsSwap memory testSettings,
-        bytes memory hookData
-    ) public payable returns (BalanceDelta delta) {
-        whichLock = 0;
-        delta = abi.decode(
-            poolManager.lock(
-                abi.encode(
-                    CallbackDataSwap(
-                        msg.sender,
-                        testSettings,
-                        key,
-                        params,
-                        hookData
-                    )
-                )
-            ),
-            (BalanceDelta)
-        );
-
-        uint256 ethBalance = address(this).balance;
-        if (ethBalance > 0)
-            CurrencyLibrary.NATIVE.transfer(msg.sender, ethBalance);
+    function decreaseMarginAmounts(PoolId id, int128 amountBase) private {
+        // These should track values in non-USDC token
+        marginSwapsAbs[id] -= abs(amountBase);
+        marginSwapsNet[id] -= amountBase;
     }
 
-    function lockAcquired(
-        bytes calldata rawData
-    ) external override returns (bytes memory) {
-        // Should always be one of these two?
-        if (whichLock == 0) {
-            return lockAcquiredSwap(rawData);
-        } else if (whichLock == 1) {
-            return lockAcquiredModPos(rawData);
-        }
-        revert("Bad lock!");
-    }
+    function increaseMarginAmounts(PoolId id, int128 amountBase) private {
+        marginSwapsAbs[id] += abs(amountBase);
+        marginSwapsNet[id] += amountBase;
 
-    /// @notice Copy/paste from PoolSwapTest
-    function lockAcquiredSwap(
-        bytes calldata rawData
-    ) internal returns (bytes memory) {
-        require(msg.sender == address(poolManager));
-
-        CallbackDataSwap memory data = abi.decode(rawData, (CallbackDataSwap));
-
-        BalanceDelta delta = poolManager.swap(
-            data.key,
-            data.params,
-            data.hookData
-        );
-
-        if (data.params.zeroForOne) {
-            if (delta.amount0() > 0) {
-                if (data.testSettings.settleUsingTransfer) {
-                    if (data.key.currency0.isNative()) {
-                        poolManager.settle{value: uint128(delta.amount0())}(
-                            data.key.currency0
-                        );
-                    } else {
-                        TestERC20(Currency.unwrap(data.key.currency0))
-                            .transferFrom(
-                                data.sender,
-                                address(poolManager),
-                                uint128(delta.amount0())
-                            );
-                        poolManager.settle(data.key.currency0);
-                    }
-                } else {
-                    // the received hook on this transfer will burn the tokens
-                    poolManager.safeTransferFrom(
-                        data.sender,
-                        address(poolManager),
-                        uint256(uint160(Currency.unwrap(data.key.currency0))),
-                        uint128(delta.amount0()),
-                        ""
-                    );
-                }
-            }
-            if (delta.amount1() < 0) {
-                if (data.testSettings.withdrawTokens) {
-                    poolManager.take(
-                        data.key.currency1,
-                        data.sender,
-                        uint128(-delta.amount1())
-                    );
-                } else {
-                    poolManager.mint(
-                        data.key.currency1,
-                        data.sender,
-                        uint128(-delta.amount1())
-                    );
-                }
-            }
-        } else {
-            if (delta.amount1() > 0) {
-                if (data.testSettings.settleUsingTransfer) {
-                    if (data.key.currency1.isNative()) {
-                        poolManager.settle{value: uint128(delta.amount1())}(
-                            data.key.currency1
-                        );
-                    } else {
-                        TestERC20(Currency.unwrap(data.key.currency1))
-                            .transferFrom(
-                                data.sender,
-                                address(poolManager),
-                                uint128(delta.amount1())
-                            );
-                        poolManager.settle(data.key.currency1);
-                    }
-                } else {
-                    // the received hook on this transfer will burn the tokens
-                    poolManager.safeTransferFrom(
-                        data.sender,
-                        address(poolManager),
-                        uint256(uint160(Currency.unwrap(data.key.currency1))),
-                        uint128(delta.amount1()),
-                        ""
-                    );
-                }
-            }
-            if (delta.amount0() < 0) {
-                if (data.testSettings.withdrawTokens) {
-                    poolManager.take(
-                        data.key.currency0,
-                        data.sender,
-                        uint128(-delta.amount0())
-                    );
-                } else {
-                    poolManager.mint(
-                        data.key.currency0,
-                        data.sender,
-                        uint128(-delta.amount0())
-                    );
-                }
-            }
-        }
-
-        return abi.encode(delta);
-    }
-
-    /// @notice Copy/paste from PoolModifyPositionTest
-    function lockAcquiredModPos(
-        bytes calldata rawData
-    ) internal returns (bytes memory) {
-        require(msg.sender == address(poolManager));
-
-        CallbackDataModPos memory data = abi.decode(
-            rawData,
-            (CallbackDataModPos)
-        );
-
-        BalanceDelta delta = poolManager.modifyPosition(
-            data.key,
-            data.params,
-            data.hookData
-        );
-
-        if (delta.amount0() > 0) {
-            if (data.key.currency0.isNative()) {
-                poolManager.settle{value: uint128(delta.amount0())}(
-                    data.key.currency0
-                );
-            } else {
-                TestERC20(Currency.unwrap(data.key.currency0)).transferFrom(
-                    data.sender,
-                    address(poolManager),
-                    uint128(delta.amount0())
-                );
-                poolManager.settle(data.key.currency0);
-            }
-        }
-        if (delta.amount1() > 0) {
-            if (data.key.currency1.isNative()) {
-                poolManager.settle{value: uint128(delta.amount1())}(
-                    data.key.currency1
-                );
-            } else {
-                TestERC20(Currency.unwrap(data.key.currency1)).transferFrom(
-                    data.sender,
-                    address(poolManager),
-                    uint128(delta.amount1())
-                );
-                poolManager.settle(data.key.currency1);
-            }
-        }
-
-        if (delta.amount0() < 0) {
-            poolManager.take(
-                data.key.currency0,
-                data.sender,
-                uint128(-delta.amount0())
-            );
-        }
-        if (delta.amount1() < 0) {
-            poolManager.take(
-                data.key.currency1,
-                data.sender,
-                uint128(-delta.amount1())
-            );
-        }
-
-        return abi.encode(delta);
+        //if (zeroIsUSDC) {
+        //    marginSwapsAbs += abs(delta.amount1());
+        //    marginSwapsNet += delta.amount1();
+        //} else {
+        //    marginSwapsAbs += abs(delta.amount0());
+        //    marginSwapsNet += delta.amount0();
+        //}
     }
 }
